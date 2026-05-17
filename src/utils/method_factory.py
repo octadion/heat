@@ -2,6 +2,12 @@
 Method factory v1.4 — adds --heat-restore-prob support.
 
 When restore_prob == 0 (default), HEAT behaves identically to v1.2 monad.
+
+NEW in vit/cifar100 patch:
+  - Dataset-aware EPOTTA source loader (cifar10 or cifar100).
+  - Architecture-aware source loader transform (CNN 32x32 or ViT 224).
+  - Graceful skip for bn_adapt on non-BN models (NoBatchNormError surfaced
+    to callers, which decide how to record the skip in their results JSON).
 """
 
 from __future__ import annotations
@@ -12,15 +18,21 @@ import torch
 import torch.nn as nn
 
 from src.methods import HEAT, EPOTTA, ReTTA, Tent, TEA, Source, BNAdapt
-from src.data import get_cifar10_loaders
+from src.data import get_clean_loaders
 
 
 def build_method(name, base_model, device, args, dataset_root="data/cifar10"):
     model = copy.deepcopy(base_model).to(device)
 
+    # Resolve dataset + arch for loaders that need them (EPOTTA source loader).
+    dataset = getattr(args, "dataset", "cifar10")
+    arch = getattr(args, "arch", None)
+
     if name == "source":
         return Source(model)
     if name == "bn_adapt":
+        # Raises NoBatchNormError if the model has no BatchNorm — caller
+        # (run_p1_benchmark / run_tier2) should catch and skip cleanly.
         return BNAdapt(model)
     if name == "tent":
         return Tent(
@@ -48,10 +60,12 @@ def build_method(name, base_model, device, args, dataset_root="data/cifar10"):
             restore_prob=getattr(args, "heat_restore_prob", 0.0),
         ).to(device)
     if name == "epotta":
-        train_loader, _ = get_cifar10_loaders(
+        train_loader, _ = get_clean_loaders(
+            dataset,
             dataset_root,
             batch_size=getattr(args, "batch_size", 64),
             num_workers=getattr(args, "num_workers", 2),
+            arch=arch,
         )
         return EPOTTA(
             model,

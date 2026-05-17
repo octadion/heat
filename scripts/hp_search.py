@@ -1,11 +1,18 @@
 """
-Multi-criteria HP search v1.2 — with --arch support.
+Multi-criteria HP search v1.2 — with --arch and --dataset support.
 
 Picks LR by Pareto-feasible criterion:
   maximize    holdout_p1_mean
   subject to  holdout_p9_last_acc >= chance + margin
 
-Same logic as v1.1 but supports both ResNet-18 and WRN-28-10.
+Same logic as v1.1 but supports ResNet-18, WRN-28-10, and ViT-S/16.
+
+NEW (vit/cifar100 patch):
+  --arch vit_s — runs the HP search on a ViT-S/16 source. Optimal LRs for
+                 ViT will differ from CNN values; user supplies a grid or
+                 takes the default.
+  --dataset {cifar10, cifar100} — selects corruption dataset + num_classes.
+  Chance accuracy in the P9 feasibility constraint now follows num_classes.
 """
 
 from __future__ import annotations
@@ -20,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
-from src.data import get_cifar10c_loader
+from src.data import get_corruption_loader, get_clean_loaders, num_classes_for
 from src.models import build_arch
 from src.methods import HEAT, Tent, TEA, EPOTTA, ReTTA
 from src.adapt import evaluate_online
@@ -41,12 +48,16 @@ DEFAULT_LR_GRID = {
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--arch", type=str, default="resnet18",
-                   choices=["resnet18", "wrn28_10"])
+                   choices=["resnet18", "wrn28_10", "vit_s"])
+    p.add_argument("--dataset", type=str, default="cifar10",
+                   choices=["cifar10", "cifar100"])
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--variant", type=str, default="heat",
                    choices=["heat", "tent", "tea", "epotta", "retta"])
     p.add_argument("--c10c-root", type=str, default="data/cifar10c")
+    p.add_argument("--c100c-root", type=str, default="data/cifar100c")
     p.add_argument("--cifar10-root", type=str, default="data/cifar10")
+    p.add_argument("--cifar100-root", type=str, default="data/cifar100")
     p.add_argument("--severity", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=2)
@@ -62,11 +73,21 @@ def parse_args():
     p.add_argument("--update-all-params", action="store_true", default=True)
     p.add_argument("--bn-only", dest="update_all_params", action="store_false")
     p.add_argument("--eval-modes", type=str, nargs="+", default=None)
+    p.add_argument("--restore-prob", type=float, default=0.0,
+                   help="HEAT-dyad restore_prob; default 0 = monad.")
 
     # Constraint
     p.add_argument("--p9-margin-pt", type=float, default=15.0)
     p.add_argument("--out-dir", type=str, default="experiments/results")
     return p.parse_args()
+
+
+def _corruption_root(args) -> str:
+    return args.c10c_root if args.dataset == "cifar10" else args.c100c_root
+
+
+def _clean_root(args) -> str:
+    return args.cifar10_root if args.dataset == "cifar10" else args.cifar100_root
 
 
 def build_method(variant, base_model, device, lr, args, eval_mode_bool):
@@ -78,6 +99,7 @@ def build_method(variant, base_model, device, lr, args, eval_mode_bool):
             aggregation=args.aggregation,
             update_all_params=args.update_all_params,
             eval_mode=eval_mode_bool,
+            restore_prob=args.restore_prob,
         ).to(device)
     elif variant == "tent":
         return Tent(m, lr=lr, optimizer_name="adam", momentum=0.9)
@@ -85,10 +107,10 @@ def build_method(variant, base_model, device, lr, args, eval_mode_bool):
         return TEA(m, lr=lr, optimizer_name="adam",
                    sgld_steps=20, sgld_lr=0.1)
     elif variant == "epotta":
-        from src.data import get_cifar10_loaders
-        train_loader, _ = get_cifar10_loaders(
-            args.cifar10_root, batch_size=args.batch_size,
-            num_workers=args.num_workers,
+        train_loader, _ = get_clean_loaders(
+            args.dataset, _clean_root(args),
+            batch_size=args.batch_size, num_workers=args.num_workers,
+            arch=args.arch,
         )
         return EPOTTA(m, source_loader=train_loader, lr=lr,
                       buffer_size=500, device=device)
@@ -100,10 +122,10 @@ def build_method(variant, base_model, device, lr, args, eval_mode_bool):
 def evaluate_single_domain(factory, corruptions, args, device):
     accs = []
     for c in corruptions:
-        loader = get_cifar10c_loader(
-            args.c10c_root, c, severity=args.severity,
-            batch_size=args.batch_size, num_workers=args.num_workers,
-            shuffle=False,
+        loader = get_corruption_loader(
+            args.dataset, _corruption_root(args), c,
+            severity=args.severity, batch_size=args.batch_size,
+            num_workers=args.num_workers, shuffle=False, arch=args.arch,
         )
         set_seed(args.seed)
         method = factory()
@@ -118,10 +140,10 @@ def evaluate_continual(factory, corruptions, args, device):
     method = factory()
     accs = []
     for c in corruptions:
-        loader = get_cifar10c_loader(
-            args.c10c_root, c, severity=args.severity,
-            batch_size=args.batch_size, num_workers=args.num_workers,
-            shuffle=False,
+        loader = get_corruption_loader(
+            args.dataset, _corruption_root(args), c,
+            severity=args.severity, batch_size=args.batch_size,
+            num_workers=args.num_workers, shuffle=False, arch=args.arch,
         )
         acc = evaluate_online(method, loader, device,
                               progress=False).accuracy
@@ -135,8 +157,10 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    num_classes = num_classes_for(args.dataset)
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    base_model = build_arch(args.arch, num_classes=10).to(device)
+    extra = {"pretrained": False} if args.arch == "vit_s" else {}
+    base_model = build_arch(args.arch, num_classes=num_classes, **extra).to(device)
     base_model.load_state_dict(ckpt["model"])
 
     lr_grid = args.lr_grid or DEFAULT_LR_GRID[args.variant]
@@ -149,14 +173,16 @@ def main():
     else:
         eval_modes = [None]
 
-    chance_acc = 0.10
+    chance_acc = 1.0 / num_classes
     p9_threshold = chance_acc + args.p9_margin_pt / 100.0
 
     results = []
-    print(f"\n=== HP search variant={args.variant}, arch={args.arch} ===")
+    print(f"\n=== HP search variant={args.variant}, arch={args.arch}, "
+          f"dataset={args.dataset} ===")
     print(f"  LR grid: {lr_grid}")
+    print(f"  chance_acc={chance_acc:.3f}, p9_threshold={p9_threshold:.3f}")
     if args.variant == "heat":
-        print(f"  eval_modes: {eval_modes}")
+        print(f"  eval_modes: {eval_modes}, restore_prob={args.restore_prob}")
 
     for em in eval_modes:
         for lr in lr_grid:
@@ -210,7 +236,9 @@ def main():
         else:
             best = None
 
-    out_path = out_dir / f"hp_search_{args.variant}_{args.arch}_seed{args.seed}.json"
+    dataset_tag = f"_{args.dataset}" if args.dataset != "cifar10" else ""
+    out_path = (out_dir /
+                f"hp_search_{args.variant}_{args.arch}{dataset_tag}_seed{args.seed}.json")
     with open(out_path, "w") as f:
         json.dump({"args": vars(args), "results": results, "best": best},
                   f, indent=2)

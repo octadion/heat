@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .base import AdaptMethod
+from .base import AdaptMethod, select_norm_affine_params
 
 
 def _softmax_entropy(logits: torch.Tensor) -> torch.Tensor:
@@ -46,17 +46,12 @@ class Tent(AdaptMethod):
     ):
         super().__init__(model)
 
-        # Freeze everything, then unfreeze BN affine
-        for p in self.model.parameters():
-            p.requires_grad = False
-        for m in self.model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                if m.weight is not None:
-                    m.weight.requires_grad = True
-                if m.bias is not None:
-                    m.bias.requires_grad = True
+        # Architecture-aware norm-affine selection (BN for CNNs, LN for ViT).
+        # Same iteration order as the prior inline code on CNNs, so the
+        # selected parameter set is identical for resnet18 / wrn28_10.
+        select_norm_affine_params(self.model)
 
-        self.model.train()  # BN tracks batch stats
+        self.model.train()  # BN tracks batch stats; LN is mode-invariant
 
         trainable = [p for p in self.model.parameters() if p.requires_grad]
         if optimizer_name.lower() == "adam":

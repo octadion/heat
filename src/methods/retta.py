@@ -35,7 +35,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .base import AdaptMethod
+from .base import AdaptMethod, select_norm_affine_params
 
 
 def _entropy(logits: torch.Tensor) -> torch.Tensor:
@@ -76,14 +76,9 @@ class ReTTA(AdaptMethod):
         self.adapt_bn_only = adapt_bn_only
 
         if self.adapt_bn_only:
-            for p in self.model.parameters():
-                p.requires_grad = False
-            for m in self.model.modules():
-                if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                    if m.weight is not None:
-                        m.weight.requires_grad = True
-                    if m.bias is not None:
-                        m.bias.requires_grad = True
+            # Arch-aware: BN affine on CNNs, LayerNorm affine on ViT.
+            # Flag name kept (`adapt_bn_only`) for backward-compatible API.
+            select_norm_affine_params(self.model)
         else:
             for p in self.model.parameters():
                 p.requires_grad = True

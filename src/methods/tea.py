@@ -42,7 +42,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .base import AdaptMethod
+from .base import AdaptMethod, select_norm_affine_params
 
 
 def _output_energy(logits: torch.Tensor) -> torch.Tensor:
@@ -97,17 +97,12 @@ class TEA(AdaptMethod):
     ):
         super().__init__(model)
 
-        # Update only BN affine params (TEA paper's choice)
-        for p in self.model.parameters():
-            p.requires_grad = False
-        for m in self.model.modules():
-            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-                if m.weight is not None:
-                    m.weight.requires_grad = True
-                if m.bias is not None:
-                    m.bias.requires_grad = True
+        # TEA paper updates only BN affine on CNNs. On non-BN architectures
+        # (ViT), fall back to LayerNorm affine — same family of normalization
+        # parameters, only architecture-appropriate.
+        select_norm_affine_params(self.model)
 
-        self.model.train()  # so BN tracks batch stats
+        self.model.train()  # so BN tracks batch stats; LN is mode-invariant
         trainable = [p for p in self.model.parameters() if p.requires_grad]
         if optimizer_name.lower() == "adam":
             self.optimizer = torch.optim.Adam(trainable, lr=lr)
