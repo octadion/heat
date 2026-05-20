@@ -221,3 +221,88 @@ class TEA(AdaptMethod):
         self.optimizer.step()
 
         return predictions
+
+
+# ----------------------------------------------------------------------------
+# Ablation variants — TEA → HEAT bridge
+# ----------------------------------------------------------------------------
+#
+# These two subclasses isolate ONE factor each in the TEA → HEAT ablation
+# path. They share TEA's optimizer/parameter setup (normalization affine,
+# Adam by default, identical hyperparameters) so the only intentional change
+# is the one named in the class. They DO NOT alter plain `TEA.adapt` —
+# `TEA.adapt` is inherited untouched on instances of the base class.
+#
+# Path: tea → tea_nonoise → tea_directenergy → heat_singlestage → heat
+#         |        |                |                  |              |
+#         |   SGLD noise off   SGLD removed       last-stage only   full
+#         |                    direct energy     (no multi-stage)
+#         baseline            descent on test       aggregation
+#                              batch
+#
+# Each step changes a single factor relative to its predecessor. See `B2` in
+# the task brief.
+# ----------------------------------------------------------------------------
+
+
+class TEANoNoise(TEA):
+    """
+    TEA with the Langevin **noise term zeroed**. SGLD updates still run for
+    `sgld_steps`, but the per-step `noise_std * randn_like(x)` term is set to
+    zero. Isolates the contribution of stochastic noise injection (vs
+    deterministic gradient-only descent on the energy surface during SGLD
+    sampling).
+
+    Everything else — optimizer, lr, trainable params, sgld_steps, sgld_lr,
+    buffer, entropy regularizer — is identical to TEA.
+    """
+
+    name = "tea_nonoise"
+
+    def __init__(self, model: nn.Module, **kwargs):
+        # Force sgld_noise=0.0; the user may try to override it but the whole
+        # point of this variant is no noise.
+        kwargs["sgld_noise"] = 0.0
+        super().__init__(model, **kwargs)
+
+
+class TEADirectEnergy(TEA):
+    """
+    TEA's objective replaced with **direct free-energy descent** on the
+    incoming test batch. No SGLD, no negative samples, no replay buffer.
+
+      loss = mean( E(x_test) ) + entropy_coef * H(softmax(f(x_test)))
+           = mean( -logsumexp_k f(x_test)_k ) + entropy_coef * H
+
+    Trainable parameter set, optimizer, lr, and entropy regularizer are
+    **identical to TEA**. This isolates the **objective change** (CD with
+    SGLD negatives → direct energy descent) from the parameter-set / optimizer
+    change that the jump from TEA to HEAT also brings.
+
+    Note: HEAT additionally (a) updates all parameters (not just norm affine),
+    (b) aggregates over multiple stages. `TEADirectEnergy` keeps TEA's
+    parameter set so that the only difference from TEA is the loss function.
+    """
+
+    name = "tea_directenergy"
+
+    # SGLD and buffer are not used; the inherited __init__ still accepts the
+    # same kwargs so the CLI/factory remains shape-compatible.
+
+    def adapt(self, x: torch.Tensor) -> torch.Tensor:
+        # Predictions for the batch (model state at arrival time).
+        with torch.no_grad():
+            predictions = self.model(x).detach()
+
+        # Direct free-energy descent on the test batch.
+        self.model.train()  # match TEA: BN tracks batch stats during step
+        logits = self.model(x)
+        e_pos = _output_energy(logits).mean()
+        loss_ent = _softmax_entropy(logits)
+        loss = e_pos + self.entropy_coef * loss_ent
+
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        self.optimizer.step()
+
+        return predictions

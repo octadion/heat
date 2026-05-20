@@ -36,7 +36,10 @@ from src.data import (
     num_classes_for,
 )
 from src.models import build_arch
-from src.methods import Source, BNAdapt, Tent, TEA, HEAT, EPOTTA, ReTTA
+from src.methods import (
+    Source, BNAdapt, Tent, TEA, TEANoNoise, TEADirectEnergy,
+    HEAT, EPOTTA, ReTTA,
+)
 from src.methods import NoBatchNormError
 from src.adapt import evaluate_online
 from src.utils import set_seed, get_device
@@ -80,6 +83,13 @@ def parse_args():
     p.add_argument("--heat-aggregation", type=str, default="sum",
                    choices=["sum", "self_gated", "self_gated_temperature"])
     p.add_argument("--heat-restore-prob", type=float, default=0.0)
+    # Optional explicit stage list. Default (None) means "all stages" — i.e.
+    # the prior HEAT behavior, bit-identical to before this patch. The
+    # heat_singlestage variant defaults to the last stage when this is
+    # omitted; passing it overrides that default for the variant too.
+    p.add_argument("--heat-stages", type=int, nargs="+", default=None,
+                   help="Explicit stage indices for HEAT / heat_singlestage. "
+                        "Default = all stages.")
     # EPOTTA
     p.add_argument("--epotta-lr", type=float, default=1e-3)
     p.add_argument("--epotta-beta", type=float, default=1.0)
@@ -123,9 +133,40 @@ def build_method(name, base_model, device, args):
     elif name == "tea":
         return TEA(model, lr=args.tea_lr, optimizer_name=args.tea_optimizer,
                    sgld_steps=args.tea_sgld_steps, sgld_lr=args.tea_sgld_lr)
+    elif name == "tea_nonoise":
+        # TEA with SGLD Langevin noise zeroed; everything else identical.
+        return TEANoNoise(
+            model, lr=args.tea_lr, optimizer_name=args.tea_optimizer,
+            sgld_steps=args.tea_sgld_steps, sgld_lr=args.tea_sgld_lr,
+        )
+    elif name == "tea_directenergy":
+        # TEA with objective replaced by direct free-energy descent on the
+        # test batch. Parameter set + optimizer kept identical to TEA.
+        return TEADirectEnergy(
+            model, lr=args.tea_lr, optimizer_name=args.tea_optimizer,
+            sgld_steps=args.tea_sgld_steps, sgld_lr=args.tea_sgld_lr,
+        )
     elif name == "heat":
+        stages = list(args.heat_stages) if args.heat_stages is not None else None
         return HEAT(
             model, lr=args.heat_lr, momentum=args.heat_momentum,
+            stages=stages,
+            eval_mode=args.heat_eval_mode,
+            temperatures=args.heat_temperatures,
+            aggregation=args.heat_aggregation,
+            restore_prob=args.heat_restore_prob,
+        ).to(device)
+    elif name == "heat_singlestage":
+        # HEAT instantiated with a single stage = the last stage. Does NOT
+        # modify heat.py; just passes stages=[last_idx]. If --heat-stages
+        # was supplied explicitly, honor that instead.
+        if args.heat_stages is not None:
+            stages = list(args.heat_stages)
+        else:
+            stages = [len(model.stage_channels) - 1]
+        return HEAT(
+            model, lr=args.heat_lr, momentum=args.heat_momentum,
+            stages=stages,
             eval_mode=args.heat_eval_mode,
             temperatures=args.heat_temperatures,
             aggregation=args.heat_aggregation,

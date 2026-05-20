@@ -17,8 +17,37 @@ import copy
 import torch
 import torch.nn as nn
 
-from src.methods import HEAT, EPOTTA, ReTTA, Tent, TEA, Source, BNAdapt
+from src.methods import (
+    HEAT, EPOTTA, ReTTA, Tent, TEA, TEANoNoise, TEADirectEnergy,
+    Source, BNAdapt,
+)
 from src.data import get_clean_loaders
+
+
+def _tea_kwargs(args):
+    """Common TEA / TEA-variant kwargs resolved from args."""
+    return dict(
+        lr=getattr(args, "tea_lr", 5e-4),
+        optimizer_name=getattr(args, "tea_optimizer", "adam"),
+        sgld_steps=getattr(args, "tea_sgld_steps", 20),
+        sgld_lr=getattr(args, "tea_sgld_lr", 0.1),
+    )
+
+
+def _heat_stages_for(args, model):
+    """
+    Resolve HEAT's `stages` argument.
+
+    - If args.heat_stages is None (CLI default), return None so HEAT picks
+      `list(range(len(model.stage_channels)))` — i.e. ALL stages — exactly
+      as before this patch. Bit-identical to pre-patch behavior.
+    - If args.heat_stages is a list of ints, return that list. Used by the
+      `heat_singlestage` variant to restrict to the final stage.
+    """
+    stages = getattr(args, "heat_stages", None)
+    if stages is None:
+        return None
+    return list(stages)
 
 
 def build_method(name, base_model, device, args, dataset_root="data/cifar10"):
@@ -42,18 +71,41 @@ def build_method(name, base_model, device, args, dataset_root="data/cifar10"):
             momentum=0.9,
         )
     if name == "tea":
-        return TEA(
-            model,
-            lr=getattr(args, "tea_lr", 5e-4),
-            optimizer_name=getattr(args, "tea_optimizer", "adam"),
-            sgld_steps=getattr(args, "tea_sgld_steps", 20),
-            sgld_lr=getattr(args, "tea_sgld_lr", 0.1),
-        )
+        return TEA(model, **_tea_kwargs(args))
+    if name == "tea_nonoise":
+        # Same as TEA but with SGLD Langevin noise zeroed. Subclass forces
+        # sgld_noise=0.0 regardless of any kwarg passed in.
+        return TEANoNoise(model, **_tea_kwargs(args))
+    if name == "tea_directenergy":
+        # Same setup (norm-affine params, Adam, same lr) but objective is
+        # direct free-energy descent on the test batch — no SGLD samples.
+        # sgld_* kwargs are accepted (for shape compat) and ignored.
+        return TEADirectEnergy(model, **_tea_kwargs(args))
     if name == "heat":
         return HEAT(
             model,
             lr=getattr(args, "heat_lr", 1e-3),
             momentum=getattr(args, "heat_momentum", 0.0),
+            stages=_heat_stages_for(args, model),
+            eval_mode=getattr(args, "heat_eval_mode", False),
+            temperatures=getattr(args, "heat_temperatures", [1.0]),
+            aggregation=getattr(args, "heat_aggregation", "sum"),
+            restore_prob=getattr(args, "heat_restore_prob", 0.0),
+        ).to(device)
+    if name == "heat_singlestage":
+        # HEAT with a single stage = the final (output-side) stage only.
+        # Identical to HEAT in every other way. We do NOT modify heat.py;
+        # we instantiate HEAT with stages=[last_stage_index].
+        last_stage = len(model.stage_channels) - 1
+        explicit_stages = _heat_stages_for(args, model)
+        # If the user explicitly passed --heat-stages, honor it (lets them
+        # study single-stage at any depth). Otherwise, default to the final.
+        stages = explicit_stages if explicit_stages is not None else [last_stage]
+        return HEAT(
+            model,
+            lr=getattr(args, "heat_lr", 1e-3),
+            momentum=getattr(args, "heat_momentum", 0.0),
+            stages=stages,
             eval_mode=getattr(args, "heat_eval_mode", False),
             temperatures=getattr(args, "heat_temperatures", [1.0]),
             aggregation=getattr(args, "heat_aggregation", "sum"),
@@ -96,6 +148,15 @@ def add_method_args(parser):
     parser.add_argument("--heat-restore-prob", type=float, default=0.0,
                         help="Stochastic restore probability for HEAT-dyad. "
                              "Default 0 = HEAT-monad (no restore).")
+    # Explicit HEAT stage selection. Default (None) is "all stages" — exactly
+    # the prior behavior. Used by the heat_singlestage ablation variant and
+    # available as a manual override for plain `heat` too. Bit-identical to
+    # pre-patch when omitted.
+    parser.add_argument("--heat-stages", type=int, nargs="+", default=None,
+                        help="Explicit list of stage indices for HEAT. "
+                             "Default = all stages (HEAT's intrinsic behavior). "
+                             "Used by heat_singlestage to restrict to the last "
+                             "stage. Pass space-separated 0-based indices.")
 
     # Tent
     parser.add_argument("--tent-lr", type=float, default=1e-3)

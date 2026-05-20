@@ -77,6 +77,26 @@ class ViTSCifar(nn.Module):
         # Build with `num_classes=0` so timm's head is an identity; we attach
         # our own. Keeping our head separate makes the HEAT contract
         # (`self.linear`) explicit.
+        #
+        # PARAMETER-NAME STABILITY (HEAT contract): the order in which
+        # submodules are registered on `self` determines the prefix order
+        # under `named_parameters()`. HEAT-dyad snapshots params by NAME at
+        # construction and looks them up by NAME at restore time, so any
+        # rename or reordering between construction and adapt time would make
+        # `_source_snapshot.get(name)` return None and silently no-op the
+        # restore. We therefore:
+        #   1. Register `self.backbone` FIRST and `self.linear` SECOND. Both
+        #      are nn.Module attributes set via simple assignment so PyTorch
+        #      adds them to `_modules` in insertion order.
+        #   2. Do not lazily create modules or parameters in `forward()`.
+        #      Hooks are added inside `_capture_block_outputs` but they
+        #      register no new parameters and are removed immediately after
+        #      use, so `named_parameters()` is invariant across forward
+        #      passes and `.to(device)` / `eval()` / `train()` transitions.
+        #   3. Validate post-construction (see _verify_param_naming below)
+        #      that every yielded name has the expected `backbone.*` or
+        #      `linear.*` prefix; this guards against future refactors that
+        #      might break the snapshot lookup.
         self.backbone = timm.create_model(
             timm_model_name,
             pretrained=pretrained,
@@ -96,6 +116,37 @@ class ViTSCifar(nn.Module):
         self.stage_channels = [VIT_S_EMBED_DIM] * len(VIT_S_STAGE_BLOCKS)
 
         self._stage_blocks = VIT_S_STAGE_BLOCKS
+
+        # Validate name stability now, while the structure is fully built.
+        # Any subsequent renaming of submodules would surface here at import
+        # time on the next checkpoint load.
+        self._verify_param_naming()
+
+    # ------------------------------------------------------------------
+    # Parameter-name invariant check
+    # ------------------------------------------------------------------
+
+    def _verify_param_naming(self) -> None:
+        """
+        Ensure every parameter name has a known stable prefix. Raises if a
+        future change introduces a different module layout that would break
+        HEAT's name-keyed source snapshot. Cheap; runs once at __init__.
+        """
+        for name, _ in self.named_parameters():
+            if not (name.startswith("backbone.") or name.startswith("linear.")):
+                raise RuntimeError(
+                    f"ViTSCifar parameter '{name}' has an unexpected prefix; "
+                    "HEAT-dyad's source snapshot is keyed by parameter name "
+                    "and requires stable prefixes (backbone.* or linear.*)."
+                )
+        # Linear head must contribute exactly weight + bias.
+        linear_params = [n for n, _ in self.named_parameters()
+                         if n.startswith("linear.")]
+        if sorted(linear_params) != ["linear.bias", "linear.weight"]:
+            raise RuntimeError(
+                f"ViTSCifar: expected linear.weight + linear.bias, got "
+                f"{linear_params}"
+            )
 
     # ------------------------------------------------------------------
     # Forward

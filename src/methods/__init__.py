@@ -12,14 +12,15 @@ from .base import (
 from .source import Source
 from .bn_adapt import BNAdapt, NoBatchNormError
 from .tent import Tent
-from .tea import TEA
+from .tea import TEA, TEANoNoise, TEADirectEnergy
 from .heat import HEAT
 from .epotta import EPOTTA
 from .retta import ReTTA
 
 __all__ = [
-    "AdaptMethod", "Source", "BNAdapt", "Tent", "TEA", "HEAT",
-    "EPOTTA", "ReTTA",
+    "AdaptMethod", "Source", "BNAdapt", "Tent",
+    "TEA", "TEANoNoise", "TEADirectEnergy",
+    "HEAT", "EPOTTA", "ReTTA",
     "select_norm_affine_params", "has_batchnorm", "has_layernorm",
     "NoBatchNormError",
 ]

@@ -145,6 +145,10 @@ class HEAT(AdaptMethod):
                     # Detach + clone to keep snapshot frozen
                     self._source_snapshot[name] = p.detach().clone()
 
+        # One-time diagnostic flag for _stochastic_restore (no-op when restore
+        # is disabled). Purely informational; does not alter numerics.
+        self._restore_diag_logged = False
+
     # ------------------------------------------------------------------
 
     def _configure_params(self):
@@ -227,6 +231,25 @@ class HEAT(AdaptMethod):
         """
         if self.restore_prob == 0.0 or not self._source_snapshot:
             return
+
+        # One-time diagnostic: report whether the snapshot keys match the
+        # parameter names seen at restore time. If they do not, every
+        # `_source_snapshot.get(name)` returns None and the restore is a
+        # silent no-op. This print fires exactly once per HEAT instance and
+        # does NOT alter parameter updates or the random stream.
+        if not self._restore_diag_logged:
+            trainable_names = [n for n, p in self.model.named_parameters()
+                               if p.requires_grad]
+            n_total = len(trainable_names)
+            n_found = sum(1 for n in trainable_names
+                          if self._source_snapshot.get(n) is not None)
+            n_missing = n_total - n_found
+            print(f"[HEAT diag] _stochastic_restore: snapshot_keys="
+                  f"{len(self._source_snapshot)}, trainable_params="
+                  f"{n_total}, matched={n_found}, missing={n_missing}, "
+                  f"restore_prob={self.restore_prob}")
+            self._restore_diag_logged = True
+
         for name, p in self.model.named_parameters():
             if not p.requires_grad:
                 continue

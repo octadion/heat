@@ -29,7 +29,9 @@ import torch
 
 from src.data import get_corruption_loader, get_clean_loaders, num_classes_for
 from src.models import build_arch
-from src.methods import HEAT, Tent, TEA, EPOTTA, ReTTA
+from src.methods import (
+    HEAT, Tent, TEA, TEANoNoise, TEADirectEnergy, EPOTTA, ReTTA,
+)
 from src.adapt import evaluate_online
 from src.utils import set_seed, get_device
 
@@ -37,11 +39,14 @@ from src.utils import set_seed, get_device
 HOLDOUT_CORRUPTIONS = ["gaussian_blur", "saturate", "spatter", "speckle_noise"]
 
 DEFAULT_LR_GRID = {
-    "heat":   [1e-4, 5e-4, 1e-3, 5e-3, 1e-2],
-    "tent":   [1e-4, 5e-4, 1e-3, 5e-3],
-    "tea":    [1e-4, 5e-4, 1e-3],
-    "epotta": [1e-4, 5e-4, 1e-3, 5e-3],
-    "retta":  [1e-4, 5e-4, 1e-3, 5e-3],
+    "heat":             [1e-4, 5e-4, 1e-3, 5e-3, 1e-2],
+    "heat_singlestage": [1e-4, 5e-4, 1e-3, 5e-3, 1e-2],
+    "tent":             [1e-4, 5e-4, 1e-3, 5e-3],
+    "tea":              [1e-4, 5e-4, 1e-3],
+    "tea_nonoise":      [1e-4, 5e-4, 1e-3],
+    "tea_directenergy": [1e-4, 5e-4, 1e-3, 5e-3],
+    "epotta":           [1e-4, 5e-4, 1e-3, 5e-3],
+    "retta":            [1e-4, 5e-4, 1e-3, 5e-3],
 }
 
 
@@ -53,7 +58,9 @@ def parse_args():
                    choices=["cifar10", "cifar100"])
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--variant", type=str, default="heat",
-                   choices=["heat", "tent", "tea", "epotta", "retta"])
+                   choices=["heat", "heat_singlestage",
+                            "tent", "tea", "tea_nonoise", "tea_directenergy",
+                            "epotta", "retta"])
     p.add_argument("--c10c-root", type=str, default="data/cifar10c")
     p.add_argument("--c100c-root", type=str, default="data/cifar100c")
     p.add_argument("--cifar10-root", type=str, default="data/cifar10")
@@ -75,6 +82,11 @@ def parse_args():
     p.add_argument("--eval-modes", type=str, nargs="+", default=None)
     p.add_argument("--restore-prob", type=float, default=0.0,
                    help="HEAT-dyad restore_prob; default 0 = monad.")
+    # Explicit stage selection for HEAT / heat_singlestage. Default (None)
+    # means all stages (current HEAT behavior; bit-identical to pre-patch).
+    p.add_argument("--heat-stages", type=int, nargs="+", default=None,
+                   help="Explicit stage indices for HEAT / heat_singlestage. "
+                        "Default = all stages.")
 
     # Constraint
     p.add_argument("--p9-margin-pt", type=float, default=15.0)
@@ -92,9 +104,27 @@ def _clean_root(args) -> str:
 
 def build_method(variant, base_model, device, lr, args, eval_mode_bool):
     m = copy.deepcopy(base_model).to(device)
+    explicit_stages = list(args.heat_stages) if args.heat_stages is not None else None
     if variant == "heat":
         return HEAT(
             m, lr=lr, momentum=0.0,
+            stages=explicit_stages,
+            temperatures=args.temperatures,
+            aggregation=args.aggregation,
+            update_all_params=args.update_all_params,
+            eval_mode=eval_mode_bool,
+            restore_prob=args.restore_prob,
+        ).to(device)
+    elif variant == "heat_singlestage":
+        # HEAT restricted to a single stage. Default: the final stage.
+        # An explicit --heat-stages overrides for sweeps over stage depth.
+        if explicit_stages is not None:
+            stages = explicit_stages
+        else:
+            stages = [len(m.stage_channels) - 1]
+        return HEAT(
+            m, lr=lr, momentum=0.0,
+            stages=stages,
             temperatures=args.temperatures,
             aggregation=args.aggregation,
             update_all_params=args.update_all_params,
@@ -106,6 +136,12 @@ def build_method(variant, base_model, device, lr, args, eval_mode_bool):
     elif variant == "tea":
         return TEA(m, lr=lr, optimizer_name="adam",
                    sgld_steps=20, sgld_lr=0.1)
+    elif variant == "tea_nonoise":
+        return TEANoNoise(m, lr=lr, optimizer_name="adam",
+                          sgld_steps=20, sgld_lr=0.1)
+    elif variant == "tea_directenergy":
+        return TEADirectEnergy(m, lr=lr, optimizer_name="adam",
+                               sgld_steps=20, sgld_lr=0.1)
     elif variant == "epotta":
         train_loader, _ = get_clean_loaders(
             args.dataset, _clean_root(args),
@@ -165,7 +201,10 @@ def main():
 
     lr_grid = args.lr_grid or DEFAULT_LR_GRID[args.variant]
 
-    if args.variant == "heat":
+    # Both `heat` and `heat_singlestage` benefit from the eval_mode sweep
+    # (model.train() vs model.eval() — relevant for BN running-stat tracking).
+    # Other variants don't expose eval_mode, so collapse to a single run.
+    if args.variant in ("heat", "heat_singlestage"):
         if args.eval_modes is None:
             eval_modes = [True, False]
         else:
@@ -181,7 +220,7 @@ def main():
           f"dataset={args.dataset} ===")
     print(f"  LR grid: {lr_grid}")
     print(f"  chance_acc={chance_acc:.3f}, p9_threshold={p9_threshold:.3f}")
-    if args.variant == "heat":
+    if args.variant in ("heat", "heat_singlestage"):
         print(f"  eval_modes: {eval_modes}, restore_prob={args.restore_prob}")
 
     for em in eval_modes:
