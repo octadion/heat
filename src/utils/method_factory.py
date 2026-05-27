@@ -91,16 +91,15 @@ def build_method(name, base_model, device, args, dataset_root="data/cifar10"):
             temperatures=getattr(args, "heat_temperatures", [1.0]),
             aggregation=getattr(args, "heat_aggregation", "sum"),
             restore_prob=getattr(args, "heat_restore_prob", 0.0),
+            diagnostic_snapshot=getattr(args, "heat_diagnostic_snapshot", False),
         ).to(device)
     if name == "heat_singlestage":
         # HEAT with a single stage = the final (output-side) stage only.
-        # Identical to HEAT in every other way. We do NOT modify heat.py;
-        # we instantiate HEAT with stages=[last_stage_index].
+        # Identical to HEAT in every other way.
         last_stage = len(model.stage_channels) - 1
         explicit_stages = _heat_stages_for(args, model)
-        # If the user explicitly passed --heat-stages, honor it (lets them
-        # study single-stage at any depth). Otherwise, default to the final.
         stages = explicit_stages if explicit_stages is not None else [last_stage]
+
         return HEAT(
             model,
             lr=getattr(args, "heat_lr", 1e-3),
@@ -110,6 +109,7 @@ def build_method(name, base_model, device, args, dataset_root="data/cifar10"):
             temperatures=getattr(args, "heat_temperatures", [1.0]),
             aggregation=getattr(args, "heat_aggregation", "sum"),
             restore_prob=getattr(args, "heat_restore_prob", 0.0),
+            diagnostic_snapshot=getattr(args, "heat_diagnostic_snapshot", False),
         ).to(device)
     if name == "epotta":
         train_loader, _ = get_clean_loaders(
@@ -148,6 +148,9 @@ def add_method_args(parser):
     parser.add_argument("--heat-restore-prob", type=float, default=0.0,
                         help="Stochastic restore probability for HEAT-dyad. "
                              "Default 0 = HEAT-monad (no restore).")
+    parser.add_argument("--heat-diagnostic-snapshot", action="store_true",
+                    help="Store source snapshot for diagnostics only. "
+                         "Needed to measure drift_l2 when restore_prob=0.")
     # Explicit HEAT stage selection. Default (None) is "all stages" — exactly
     # the prior behavior. Used by the heat_singlestage ablation variant and
     # available as a manual override for plain `heat` too. Bit-identical to

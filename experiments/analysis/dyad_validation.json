@@ -1,0 +1,27 @@
+{
+  "configs": [],
+  "files_considered": [],
+  "matches_by_pattern": {
+    "experiments/results/p9*wrn*diag*seed*_sev5.json": [],
+    "experiments/results/p9_*diag*seed*_sev*.json": [],
+    "experiments/results/p9_*heat*seed*_sev*.json": [],
+    "experiments/results/p9_resnet18*heat*p0*diag*seed*_sev5.json": [],
+    "experiments/results/p9_resnet18*heat*p005*diag*seed*_sev5.json": [],
+    "experiments/results/p9_resnet18*heat*p025*diag*seed*_sev5.json": [],
+    "experiments/results/p9_wrn28_10*diag*seed*_sev5.json": []
+  },
+  "patterns": [
+    "experiments/results/p9_resnet18*heat*p0*diag*seed*_sev5.json",
+    "experiments/results/p9_resnet18*heat*p005*diag*seed*_sev5.json",
+    "experiments/results/p9_resnet18*heat*p025*diag*seed*_sev5.json",
+    "experiments/results/p9_wrn28_10*diag*seed*_sev5.json",
+    "experiments/results/p9*wrn*diag*seed*_sev5.json",
+    "experiments/results/p9_*diag*seed*_sev*.json",
+    "experiments/results/p9_*heat*seed*_sev*.json"
+  ],
+  "plots": [],
+  "skipped_files": [],
+  "warnings": [
+    "No files matched the P9 diagnostic glob patterns."
+  ]
+}

@@ -185,40 +185,105 @@ def run_p8(args, base_model, device):
 
 
 def run_p9(args, base_model, device):
-    """Continual stream — extends with ECE per corruption + forgetting metric."""
+    """Continual stream — extends with ECE + drift/grad diagnostics for HEAT."""
     corruptions = args.corruptions or P9_DEFAULT_STREAM
     results = {m: {} for m in args.methods}
     summary = {}
+
     for m_name in args.methods:
         print(f"\n=== {m_name} (continual stream of {len(corruptions)}) ===")
         set_seed(args.seed)
         method = _safe_build(m_name, base_model, device, args)
+
         if method is None:
             results[m_name] = {"_skipped": True}
             summary[m_name] = {"skipped": True}
             continue
+
         if m_name == "heat":
-            print(f"  [config] lr={args.heat_lr}, restore_prob={args.heat_restore_prob}")
+            print(
+                f"  [config] lr={args.heat_lr}, "
+                f"restore_prob={args.heat_restore_prob}, "
+                f"diagnostic_snapshot={getattr(args, 'heat_diagnostic_snapshot', False)}"
+            )
+
         per_corruption = {}
+        stream_diagnostics = []
+        global_step = 0
+
         for c in corruptions:
             loader = get_corruption_loader(
-                args.dataset, _corruption_root(args), c,
-                severity=args.severity, batch_size=args.batch_size,
-                num_workers=args.num_workers, shuffle=False, arch=args.arch,
+                args.dataset,
+                _corruption_root(args),
+                c,
+                severity=args.severity,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                shuffle=False,
+                arch=args.arch,
             )
-            r = evaluate_online(method, loader, device, progress=False)
-            per_corruption[c] = _result_to_dict(r)
-            print(f"  {c:20s}  acc={r.accuracy:.4f}  ece={r.ece:.4f}")
+
+            # IMPORTANT:
+            # collect_diagnostics=True makes evaluate_online call
+            # method.adapt_with_diagnostics(x), not method.adapt(x).
+            collect_diag = (m_name == "heat")
+
+            r = evaluate_online(
+                method,
+                loader,
+                device,
+                collect_diagnostics=collect_diag,
+                progress=False,
+            )
+
+            result_dict = _result_to_dict(r)
+
+            # Save per-step HEAT diagnostics.
+            # Each corruption has its own local step, but global_step continues
+            # across the whole continual stream.
+            if collect_diag:
+                diagnostics = []
+                for local_step, d in enumerate(r.diagnostics):
+                    row = {
+                        "step": global_step + local_step,
+                        "local_step": local_step,
+                        "corruption": c,
+                        "restore_prob": d.get("restore_prob"),
+                        "drift_l2": d.get("drift_l2"),
+                        "grad_l2": d.get("grad_l2"),
+                        "total_grad_norm": d.get("total_grad_norm"),
+                        "energy": d.get("energy"),
+                    }
+                    diagnostics.append(row)
+                    stream_diagnostics.append(row)
+
+                result_dict["diagnostics"] = diagnostics
+                global_step += len(r.diagnostics)
+
+            per_corruption[c] = result_dict
+
+            if collect_diag and r.diagnostics:
+                last_diag = r.diagnostics[-1]
+                print(
+                    f"  {c:20s}  acc={r.accuracy:.4f}  ece={r.ece:.4f}  "
+                    f"drift={last_diag.get('drift_l2', 0.0):.3f}  "
+                    f"grad={last_diag.get('grad_l2', 0.0):.3f}"
+                )
+            else:
+                print(f"  {c:20s}  acc={r.accuracy:.4f}  ece={r.ece:.4f}")
+
         results[m_name] = per_corruption
 
         accs = [per_corruption[c]["accuracy"] for c in corruptions]
         eces = [per_corruption[c]["ece"] for c in corruptions]
+
         peak_acc = max(accs)
         peak_idx = accs.index(peak_acc)
         last_acc = accs[-1]
         forgetting = peak_acc - last_acc
         mean_acc = sum(accs) / len(accs)
         mean_ece = sum(eces) / len(eces)
+
         summary[m_name] = {
             "mean_accuracy": mean_acc,
             "last_accuracy": last_acc,
@@ -227,9 +292,20 @@ def run_p9(args, base_model, device):
             "forgetting": forgetting,
             "mean_ece": mean_ece,
         }
-        print(f"  → mean={mean_acc:.4f}  last={last_acc:.4f}  "
-              f"peak={peak_acc:.4f}  forgetting={forgetting:.4f}  "
-              f"mean_ece={mean_ece:.4f}")
+
+        if m_name == "heat":
+            summary[m_name]["num_diagnostic_steps"] = len(stream_diagnostics)
+            summary[m_name]["stream_diagnostics"] = stream_diagnostics
+
+        print(
+            f"  → mean={mean_acc:.4f}  last={last_acc:.4f}  "
+            f"peak={peak_acc:.4f}  forgetting={forgetting:.4f}  "
+            f"mean_ece={mean_ece:.4f}"
+        )
+
+        if m_name == "heat":
+            print(f"  → diagnostic_steps={len(stream_diagnostics)}")
+
     return {"per_corruption": results, "summary": summary}
 
 

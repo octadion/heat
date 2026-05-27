@@ -90,6 +90,7 @@ class HEAT(AdaptMethod):
         eval_mode: bool = False,
         update_direction: str = "-grad",
         restore_prob: float = 0.0,
+        diagnostic_snapshot: bool = False,
     ):
         super().__init__(model)
 
@@ -116,6 +117,8 @@ class HEAT(AdaptMethod):
             raise ValueError(f"restore_prob must be in [0,1], got {restore_prob}")
         self.restore_prob = float(restore_prob)
 
+        self.diagnostic_snapshot = bool(diagnostic_snapshot)
+
         # Fixed projections
         head_in_dim = model.linear.in_features
         self.projections: dict[int, torch.Tensor] = {}
@@ -124,8 +127,11 @@ class HEAT(AdaptMethod):
             if identity_at_match and in_ch == head_in_dim:
                 W = torch.eye(head_in_dim)
             else:
-                W = _orthogonal_projection(in_ch, head_in_dim,
-                                           seed=projection_seed + l)
+                W = _orthogonal_projection(
+                    in_ch,
+                    head_in_dim,
+                    seed=projection_seed + l,
+                )
             W.requires_grad_(False)
             self.projections[l] = W
 
@@ -135,18 +141,23 @@ class HEAT(AdaptMethod):
         trainable = [p for p in self.model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.SGD(trainable, lr=lr, momentum=momentum)
 
-        # Source snapshot — ONLY created if dyad mode is enabled.
-        # When restore_prob == 0, this dict stays empty and no per-step work
-        # is added. v1.2 backward compatibility preserved.
+        # Source snapshot for dyad restore.
+        # Used for actual stochastic restore when restore_prob > 0.
         self._source_snapshot: dict[str, torch.Tensor] = {}
         if self.restore_prob > 0:
             for name, p in self.model.named_parameters():
                 if p.requires_grad:
-                    # Detach + clone to keep snapshot frozen
                     self._source_snapshot[name] = p.detach().clone()
 
-        # One-time diagnostic flag for _stochastic_restore (no-op when restore
-        # is disabled). Purely informational; does not alter numerics.
+        # Diagnostic-only snapshot.
+        # Important for p=0 monad: no restore is used, but we still want drift_l2.
+        self._diagnostic_source_snapshot: dict[str, torch.Tensor] = {}
+        if self.diagnostic_snapshot and self.restore_prob == 0.0:
+            for name, p in self.model.named_parameters():
+                if p.requires_grad:
+                    self._diagnostic_source_snapshot[name] = p.detach().clone()
+
+        # One-time diagnostic flag for _stochastic_restore.
         self._restore_diag_logged = False
 
     # ------------------------------------------------------------------
@@ -172,10 +183,17 @@ class HEAT(AdaptMethod):
 
     def to(self, device):
         self.projections = {l: W.to(device) for l, W in self.projections.items()}
+
         if self._source_snapshot:
             self._source_snapshot = {
                 k: v.to(device) for k, v in self._source_snapshot.items()
             }
+
+        if self._diagnostic_source_snapshot:
+            self._diagnostic_source_snapshot = {
+                k: v.to(device) for k, v in self._diagnostic_source_snapshot.items()
+            }
+
         return self
 
     # ------------------------------------------------------------------
@@ -317,6 +335,7 @@ class HEAT(AdaptMethod):
         with torch.no_grad():
             E_all = self._per_stage_temp_energies(stages)   # (S, T, B)
             stage_energy_means = E_all.mean(dim=(1, 2)).tolist()
+
             if self.aggregation == "self_gated":
                 weights = F.softmax(-E_all, dim=0)
                 stage_weight_means = weights.mean(dim=(1, 2)).tolist()
@@ -328,28 +347,80 @@ class HEAT(AdaptMethod):
         self.optimizer.zero_grad(set_to_none=True)
         P.backward()
 
-        # CAPTURE grad norms RIGHT NOW — before any modification or step
+        # ------------------------------------------------------------
+        # Diagnostics BEFORE:
+        #   1. _apply_direction_to_grads()
+        #   2. optimizer.step()
+        #   3. _stochastic_restore()
+        #
+        # So:
+        #   drift_l2 = ||theta_t - theta_source||
+        #   grad_l2  = ||grad P(theta_t)||
+        # ------------------------------------------------------------
+
         param_grad_norms: dict[str, float] = {}
+        grad_sq = 0.0
+        drift_sq = 0.0
+
+        # For dyad p>0, use _source_snapshot.
+        # For monad p=0, use _diagnostic_source_snapshot if enabled.
+        if self._source_snapshot:
+            snapshot = self._source_snapshot
+        else:
+            snapshot = self._diagnostic_source_snapshot
+
         for name, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+
+            # Gradient norm
             if p.grad is not None:
-                param_grad_norms[name] = p.grad.detach().norm().item()
+                g_norm = p.grad.detach().norm().item()
+                param_grad_norms[name] = g_norm
+                grad_sq += g_norm * g_norm
             else:
                 param_grad_norms[name] = 0.0
+
+            # Drift from source parameter snapshot
+            src = snapshot.get(name)
+            if src is not None:
+                drift_sq += (p.detach() - src).pow(2).sum().item()
+
+        grad_l2 = grad_sq ** 0.5
+        drift_l2 = drift_sq ** 0.5
+
+        stage_grad_norms = {}
+        for name, gn in param_grad_norms.items():
+            # ResNet uses stage1..stage4; WRN uses block1..block3.
+            if name.startswith("stage"):
+                key = name.split(".")[0]
+            elif name.startswith("block"):
+                key = name.split(".")[0]
+            elif name.startswith("linear"):
+                key = "linear"
+            else:
+                key = "stem_or_other"
+            stage_grad_norms[key] = stage_grad_norms.get(key, 0.0) + gn * gn
+        stage_grad_norms = {k: v ** 0.5 for k, v in stage_grad_norms.items()}
 
         diags = {
             "energy": float(P.detach().item()),
             "param_grad_norms": param_grad_norms,
+            "grad_l2": grad_l2,
+            "drift_l2": drift_l2,
+            "total_grad_norm": grad_l2,
             "stages": list(self.stages),
             "temperatures": list(self.temperatures),
             "aggregation": self.aggregation,
             "stage_energy_means": stage_energy_means,
             "stage_weight_means": stage_weight_means,
             "restore_prob": self.restore_prob,
+            "diagnostic_snapshot": self.diagnostic_snapshot,
+            "snapshot_scope": "trainable_named_parameters_only",
+            "bn_buffers_in_drift": False,
         }
-        total_sq = sum(v * v for v in param_grad_norms.values())
-        diags["total_grad_norm"] = total_sq ** 0.5
-
-        # Now safe to apply direction op and step
+        diags["stage_grad_norms"] = stage_grad_norms
+        # Now safe to apply direction op and update
         self._apply_direction_to_grads()
         self.optimizer.step()
 
