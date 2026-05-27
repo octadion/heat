@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import math
 import sys
 from pathlib import Path
@@ -14,11 +15,13 @@ from scripts.analysis_common import (
     diagnostics_for_file,
     ensure_analysis_dirs,
     extract_metadata,
+    find_key,
     find_json_files,
     group_rows_by_block,
     load_json,
     mean_or_none,
     row_metric,
+    safe_float,
     stationary_rows,
     write_json,
     write_text,
@@ -91,6 +94,43 @@ def fit_models(xs: list[float], ys: list[float]) -> dict[str, Any]:
     }
 
 
+def energy_is_invalid(row: dict[str, Any]) -> bool:
+    if row.get("energy") is None:
+        return False
+    try:
+        value = float(row["energy"])
+    except (TypeError, ValueError):
+        return True
+    return not math.isfinite(value)
+
+
+def config_health(rows: list[dict[str, Any]], data: dict[str, Any] | None = None) -> dict[str, Any]:
+    invalid_flag = any(bool(row.get("invalid")) for row in rows)
+    if data is not None:
+        invalid_flag = invalid_flag or bool(find_key(data, {"invalid"}))
+    has_nan_or_inf_energy = any(energy_is_invalid(row) for row in rows)
+    drift_values = [row_metric(row, "drift_l2") for row in rows]
+    drift_values = [v for v in drift_values if v is not None]
+    max_drift_l2 = max(drift_values) if drift_values else None
+    drift_over_100 = max_drift_l2 is not None and max_drift_l2 > 100.0
+    stable = not (invalid_flag or has_nan_or_inf_energy or drift_over_100)
+    reasons = []
+    if invalid_flag:
+        reasons.append("invalid=True")
+    if has_nan_or_inf_energy:
+        reasons.append("NaN/Inf energy")
+    if drift_over_100:
+        reasons.append("drift_l2 > 100")
+    return {
+        "invalid": invalid_flag,
+        "has_nan_or_inf_energy": has_nan_or_inf_energy,
+        "max_drift_l2": max_drift_l2,
+        "drift_over_100": drift_over_100,
+        "stable": stable,
+        "unstable_reasons": reasons,
+    }
+
+
 def build_points_for_file(
     data: dict[str, Any],
     path: Path,
@@ -105,6 +145,7 @@ def build_points_for_file(
         return [], ["accuracy not present in the same file"], method
 
     meta = extract_metadata(data, path, rows)
+    health = config_health(rows, data)
     groups = group_rows_by_block(rows)
     points: list[dict[str, Any]] = []
     for corruption, group in groups.items():
@@ -117,6 +158,7 @@ def build_points_for_file(
         if drift_mean is None:
             warnings.append(f"{corruption}: missing stationary drift_l2")
             continue
+        log_drift = math.log10(drift_mean + 1e-12)
         accuracy = accuracies[corruption]
         points.append({
             "file": str(path),
@@ -127,15 +169,96 @@ def build_points_for_file(
             "method": method,
             "corruption": corruption,
             "stationary_drift_l2": drift_mean,
+            "log10_stationary_drift_l2": log_drift,
             "stationary_grad_l2": grad_mean,
             "accuracy": accuracy,
             "error": 1.0 - accuracy,
             "stationary_rows": len(stat_rows),
+            "config_invalid": health["invalid"],
+            "has_nan_or_inf_energy": health["has_nan_or_inf_energy"],
+            "config_max_drift_l2": health["max_drift_l2"],
+            "config_drift_over_100": health["drift_over_100"],
+            "stable": health["stable"],
+            "unstable_reasons": health["unstable_reasons"],
         })
     return points, warnings, method
 
 
-def plot_scatter(points: list[dict[str, Any]], fits: dict[str, Any], out_path: Path) -> bool:
+def summarize_axis(points: list[dict[str, Any]], x_key: str) -> dict[str, Any]:
+    xs: list[float] = []
+    ys: list[float] = []
+    for point in points:
+        x = safe_float(point.get(x_key))
+        y = safe_float(point.get("error"))
+        if x is None or y is None:
+            continue
+        xs.append(x)
+        ys.append(y)
+    return {
+        "n": len(xs),
+        "pearson": pearson_correlation(xs, ys),
+        "spearman": spearman_correlation(xs, ys),
+        "fits": fit_models(xs, ys),
+    }
+
+
+def summarize_subset(points: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "n": len(points),
+        "raw_drift": summarize_axis(points, "stationary_drift_l2"),
+        "log10_drift": summarize_axis(points, "log10_stationary_drift_l2"),
+    }
+
+
+def report_groups(points: list[dict[str, Any]]) -> dict[str, Any]:
+    stable = [p for p in points if p.get("stable")]
+    return {
+        "all_points": summarize_subset(points),
+        "stable_only": summarize_subset(stable),
+        "resnet18_stable_only": summarize_subset([
+            p for p in stable if p.get("arch") == "resnet18"
+        ]),
+        "wrn28_10_stable_only": summarize_subset([
+            p for p in stable if p.get("arch") == "wrn28_10"
+        ]),
+        "dyad_only_p_gt_0_stable_only": summarize_subset([
+            p for p in stable
+            if p.get("restore_prob") is not None and p["restore_prob"] > 0
+        ]),
+    }
+
+
+def filter_points(points: list[dict[str, Any]], args: argparse.Namespace) -> list[dict[str, Any]]:
+    selected = list(points)
+    if args.stable_only:
+        selected = [p for p in selected if p.get("stable")]
+    if args.arch != "all":
+        selected = [p for p in selected if p.get("arch") == args.arch]
+    if args.exclude_p0:
+        selected = [
+            p for p in selected
+            if p.get("restore_prob") is None or p.get("restore_prob") != 0.0
+        ]
+    return selected
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stable-only", action="store_true",
+                        help="Exclude configs with invalid=True, NaN/Inf energy, or drift_l2 > 100.")
+    parser.add_argument("--arch", choices=["resnet18", "wrn28_10", "all"], default="all")
+    parser.add_argument("--exclude-p0", action="store_true",
+                        help="Exclude restore_prob == 0 points from the filtered point set.")
+    return parser.parse_args()
+
+
+def plot_scatter(
+    points: list[dict[str, Any]],
+    fits: dict[str, Any],
+    out_path: Path,
+    x_key: str,
+    x_label: str,
+) -> bool:
     if not points:
         return False
     try:
@@ -147,7 +270,7 @@ def plot_scatter(points: list[dict[str, Any]], fits: dict[str, Any], out_path: P
     except Exception:
         return False
 
-    xs = [p["stationary_drift_l2"] for p in points]
+    xs = [p[x_key] for p in points]
     ys = [p["error"] for p in points]
 
     fig, ax = plt.subplots(figsize=(6.5, 5.0))
@@ -162,7 +285,7 @@ def plot_scatter(points: list[dict[str, Any]], fits: dict[str, Any], out_path: P
         ax.plot(x_grid, a * x_grid + b, linewidth=1.2, label="linear")
         ax.legend()
 
-    ax.set_xlabel("stationary drift_l2")
+    ax.set_xlabel(x_label)
     ax.set_ylabel("error (1 - accuracy)")
     ax.grid(alpha=0.25)
     fig.tight_layout()
@@ -172,15 +295,17 @@ def plot_scatter(points: list[dict[str, Any]], fits: dict[str, Any], out_path: P
 
 
 def build_summary_md(payload: dict[str, Any]) -> str:
-    stats = payload["statistics"]
+    groups = payload["statistics"]["groups"]
     lines = [
-        "# Drift Accuracy",
+        "# Drift Accuracy Filtered",
         "",
         "This analysis builds per-corruption points from existing P9 diagnostic JSON files.",
         "",
         f"- Files matched: {len(payload['files_considered'])}",
-        f"- Points analyzed: {len(payload['points'])}",
+        f"- Total points: {len(payload['points'])}",
+        f"- Filtered points: {len(payload['filtered_points'])}",
         f"- Files skipped: {len(payload['skipped_files'])}",
+        f"- Active filters: {payload['active_filters']}",
         "",
     ]
     if not payload["points"]:
@@ -188,14 +313,25 @@ def build_summary_md(payload: dict[str, Any]) -> str:
             "No drift-to-error points were available.",
             "",
         ])
-    else:
-        lines.extend([
-            f"- Pearson correlation: {stats.get('pearson')}",
-            f"- Spearman correlation: {stats.get('spearman')}",
-            f"- Linear fit: {stats.get('fits', {}).get('linear')}",
-            f"- Quadratic fit: {stats.get('fits', {}).get('quadratic_x2_only')}",
-            "",
-        ])
+
+    lines.extend([
+        "| cohort | n | raw Pearson | raw Spearman | log10 Pearson | log10 Spearman |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ])
+    for name, stats in groups.items():
+        raw = stats["raw_drift"]
+        log_stats = stats["log10_drift"]
+        lines.append(
+            "| {name} | {n} | {rp} | {rs} | {lp} | {ls} |".format(
+                name=name,
+                n=stats.get("n"),
+                rp=raw.get("pearson"),
+                rs=raw.get("spearman", {}).get("correlation"),
+                lp=log_stats.get("pearson"),
+                ls=log_stats.get("spearman", {}).get("correlation"),
+            )
+        )
+    lines.append("")
 
     if payload["skipped_files"]:
         lines.extend(["## Skipped Files", ""])
@@ -213,6 +349,7 @@ def build_summary_md(payload: dict[str, Any]) -> str:
 
 
 def main() -> None:
+    args = parse_args()
     analysis_dir, plot_dir = ensure_analysis_dirs()
     files, matches = find_json_files(DEFAULT_P9_PATTERNS)
     warnings: list[str] = []
@@ -235,19 +372,35 @@ def main() -> None:
             points.extend(file_points)
             warnings.extend(f"{path}: {w}" for w in file_warnings)
 
-    xs = [p["stationary_drift_l2"] for p in points]
-    ys = [p["error"] for p in points]
-    fits = fit_models(xs, ys)
+    filtered_points = filter_points(points, args)
+    groups = report_groups(points)
     stats = {
-        "pearson": pearson_correlation(xs, ys),
-        "spearman": spearman_correlation(xs, ys),
-        "fits": fits,
+        "groups": groups,
+        "filtered_raw_drift": summarize_axis(filtered_points, "stationary_drift_l2"),
+        "filtered_log10_drift": summarize_axis(filtered_points, "log10_stationary_drift_l2"),
     }
 
     plots: list[str] = []
     scatter_path = plot_dir / "drift_accuracy_scatter.png"
-    if plot_scatter(points, fits, scatter_path):
+    filtered_raw = stats["filtered_raw_drift"]
+    if plot_scatter(
+        filtered_points,
+        filtered_raw.get("fits", {}),
+        scatter_path,
+        "stationary_drift_l2",
+        "stationary drift_l2",
+    ):
         plots.append(str(scatter_path))
+    log_scatter_path = plot_dir / "drift_accuracy_log_scatter.png"
+    filtered_log = stats["filtered_log10_drift"]
+    if plot_scatter(
+        filtered_points,
+        filtered_log.get("fits", {}),
+        log_scatter_path,
+        "log10_stationary_drift_l2",
+        "log10(stationary drift_l2 + 1e-12)",
+    ):
+        plots.append(str(log_scatter_path))
 
     payload = {
         "patterns": DEFAULT_P9_PATTERNS,
@@ -256,13 +409,22 @@ def main() -> None:
         "skipped_files": skipped_files,
         "warnings": warnings,
         "points": points,
+        "filtered_points": filtered_points,
+        "active_filters": {
+            "stable_only": args.stable_only,
+            "arch": args.arch,
+            "exclude_p0": args.exclude_p0,
+        },
         "statistics": stats,
         "plots": plots,
     }
+    write_json(analysis_dir / "drift_accuracy_filtered.json", payload)
+    write_text(analysis_dir / "drift_accuracy_filtered_summary.md", build_summary_md(payload))
+    # Keep the original filenames current for callers that still expect them.
     write_json(analysis_dir / "drift_accuracy.json", payload)
     write_text(analysis_dir / "drift_accuracy_summary.md", build_summary_md(payload))
-    print(f"[saved] {analysis_dir / 'drift_accuracy.json'}")
-    print(f"[saved] {analysis_dir / 'drift_accuracy_summary.md'}")
+    print(f"[saved] {analysis_dir / 'drift_accuracy_filtered.json'}")
+    print(f"[saved] {analysis_dir / 'drift_accuracy_filtered_summary.md'}")
     print(f"[plots] {len(plots)}")
 
 

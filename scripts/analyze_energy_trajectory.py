@@ -14,6 +14,7 @@ from scripts.analysis_common import (
     diagnostics_for_file,
     ensure_analysis_dirs,
     extract_metadata,
+    find_key,
     find_json_files,
     load_json,
     safe_float,
@@ -126,6 +127,30 @@ def summarize_energy(
     }
 
 
+def summarize_stability_group(configs: list[dict[str, Any]]) -> dict[str, Any]:
+    energy_means = [
+        cfg["energy_mean"]
+        for cfg in configs
+        if cfg.get("energy_mean") is not None
+    ]
+    jump_counts = [len(cfg.get("extreme_jumps", [])) for cfg in configs]
+    return {
+        "num_configs": len(configs),
+        "files": [cfg.get("file") for cfg in configs],
+        "mean_energy_mean": (sum(energy_means) / len(energy_means)) if energy_means else None,
+        "total_extreme_jumps": sum(jump_counts),
+    }
+
+
+def stability_summary(configs: list[dict[str, Any]]) -> dict[str, Any]:
+    stable = [cfg for cfg in configs if not cfg.get("collapse")]
+    collapsed = [cfg for cfg in configs if cfg.get("collapse")]
+    return {
+        "stable_configs": summarize_stability_group(stable),
+        "collapsed_configs": summarize_stability_group(collapsed),
+    }
+
+
 def plot_energy(
     rows: list[dict[str, Any]],
     meta: dict[str, Any],
@@ -184,12 +209,12 @@ def build_summary_md(payload: dict[str, Any]) -> str:
         ])
     else:
         lines.extend([
-            "| file | arch | seed | p | n | min | max | mean | std | monotonicity | jumps | invalid |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- |",
+            "| file | arch | seed | p | n | min | max | mean | std | monotonicity | jumps | invalid | collapse |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | --- | --- |",
         ])
         for cfg in configs:
             lines.append(
-                "| {file} | {arch} | {seed} | {p} | {n} | {mn} | {mx} | {mean} | {std} | {mono} | {jumps} | {invalid} |".format(
+                "| {file} | {arch} | {seed} | {p} | {n} | {mn} | {mx} | {mean} | {std} | {mono} | {jumps} | {invalid} | {collapse} |".format(
                     file=Path(cfg["file"]).name,
                     arch=cfg.get("arch"),
                     seed=cfg.get("seed"),
@@ -201,10 +226,30 @@ def build_summary_md(payload: dict[str, Any]) -> str:
                     std=cfg.get("energy_std"),
                     mono=cfg.get("monotonicity"),
                     jumps=len(cfg.get("extreme_jumps", [])),
-                    invalid=cfg.get("has_nan_or_inf"),
+                    invalid=cfg.get("invalid") or cfg.get("has_nan_or_inf"),
+                    collapse=cfg.get("collapse"),
                 )
             )
         lines.append("")
+
+    stability = payload.get("stability_summary", {})
+    lines.extend([
+        "## Stable vs Collapsed",
+        "",
+        "| group | configs | mean_energy_mean | total_extreme_jumps |",
+        "| --- | ---: | ---: | ---: |",
+    ])
+    for name in ("stable_configs", "collapsed_configs"):
+        info = stability.get(name, {})
+        lines.append(
+            "| {name} | {n} | {mean} | {jumps} |".format(
+                name=name,
+                n=info.get("num_configs"),
+                mean=info.get("mean_energy_mean"),
+                jumps=info.get("total_extreme_jumps"),
+            )
+        )
+    lines.append("")
 
     if payload["skipped_files"]:
         lines.extend(["## Skipped Files", ""])
@@ -251,6 +296,16 @@ def main() -> None:
 
         meta = extract_metadata(data, path, rows)
         cfg = summarize_energy(meta, method, rows, layout)
+        invalid_flag = bool(find_key(data, {"invalid"})) or any(
+            bool(row.get("invalid")) for row in rows
+        )
+        cfg["invalid"] = invalid_flag
+        cfg["collapse"] = bool(
+            invalid_flag
+            or cfg.get("has_nan_or_inf")
+            or len(cfg.get("extreme_jumps", [])) > 0
+        )
+        cfg["stability_label"] = "collapsed" if cfg["collapse"] else "stable"
         configs.append(cfg)
 
         plot_path = plot_dir / f"energy_{config_id(meta, method)}.png"
@@ -264,6 +319,7 @@ def main() -> None:
         "skipped_files": skipped_files,
         "warnings": warnings,
         "configs": configs,
+        "stability_summary": stability_summary(configs),
         "plots": plots,
     }
     write_json(analysis_dir / "energy_trajectory.json", payload)

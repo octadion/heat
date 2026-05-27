@@ -21,6 +21,20 @@
   ],
   "plots": [],
   "skipped_files": [],
+  "stability_summary": {
+    "collapsed_configs": {
+      "files": [],
+      "mean_energy_mean": null,
+      "num_configs": 0,
+      "total_extreme_jumps": 0
+    },
+    "stable_configs": {
+      "files": [],
+      "mean_energy_mean": null,
+      "num_configs": 0,
+      "total_extreme_jumps": 0
+    }
+  },
   "warnings": [
     "No files matched the P9 diagnostic glob patterns."
   ]

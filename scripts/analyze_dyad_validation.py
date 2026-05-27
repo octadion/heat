@@ -93,14 +93,16 @@ def compute_config_summary(
     eta = meta.get("eta")
     n_steps = n_info["N"]
     alpha = None
-    theoretical_mu = None
-    deviation_pct = None
+    theoretical_mu_proxy = None
+    deviation_proxy_pct = None
     if p is not None and p > 0 and n_steps is not None:
         alpha = (1.0 - p) ** n_steps
     if p is not None and p > 0 and eta is not None and mean_grad is not None:
-        theoretical_mu = ((1.0 - p) * eta / p) * mean_grad
-        if theoretical_mu != 0 and empirical_mu is not None:
-            deviation_pct = 100.0 * (empirical_mu - theoretical_mu) / theoretical_mu
+        theoretical_mu_proxy = ((1.0 - p) * eta / p) * mean_grad
+        if theoretical_mu_proxy != 0 and empirical_mu is not None:
+            deviation_proxy_pct = 100.0 * (
+                empirical_mu - theoretical_mu_proxy
+            ) / theoretical_mu_proxy
 
     return {
         **meta,
@@ -116,8 +118,8 @@ def compute_config_summary(
         "between_block_grad_l2_mean_variance": between_block_variance,
         "empirical_mu": empirical_mu,
         "mean_grad": mean_grad,
-        "theoretical_mu": theoretical_mu,
-        "deviation_pct": deviation_pct,
+        "theoretical_mu_proxy": theoretical_mu_proxy,
+        "deviation_proxy_pct": deviation_proxy_pct,
     }
 
 
@@ -181,9 +183,9 @@ def plot_empirical_vs_theoretical(configs: list[dict[str, Any]], out_path: Path)
         if c.get("restore_prob") is not None
         and c["restore_prob"] > 0
         and c.get("empirical_mu") is not None
-        and c.get("theoretical_mu") is not None
+        and c.get("theoretical_mu_proxy") is not None
         and math.isfinite(c["empirical_mu"])
-        and math.isfinite(c["theoretical_mu"])
+        and math.isfinite(c["theoretical_mu_proxy"])
     ]
     if not points:
         return False
@@ -195,7 +197,7 @@ def plot_empirical_vs_theoretical(configs: list[dict[str, Any]], out_path: Path)
     except Exception:
         return False
 
-    xs = [p["theoretical_mu"] for p in points]
+    xs = [p["theoretical_mu_proxy"] for p in points]
     ys = [p["empirical_mu"] for p in points]
     lo = min(xs + ys)
     hi = max(xs + ys)
@@ -209,7 +211,7 @@ def plot_empirical_vs_theoretical(configs: list[dict[str, Any]], out_path: Path)
     for point, x, y in zip(points, xs, ys):
         label = config_id(point, point.get("method"))
         ax.annotate(label, (x, y), fontsize=7, xytext=(4, 4), textcoords="offset points")
-    ax.set_xlabel("theoretical stationary drift")
+    ax.set_xlabel("theoretical stationary drift proxy")
     ax.set_ylabel("empirical stationary drift")
     ax.grid(alpha=0.25)
     fig.tight_layout()
@@ -218,12 +220,80 @@ def plot_empirical_vs_theoretical(configs: list[dict[str, Any]], out_path: Path)
     return True
 
 
+def close_prob(value: Any, target: float, tol: float = 1e-9) -> bool:
+    if value is None:
+        return False
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return abs(number - target) <= tol
+
+
+def arch_matches(value: Any, target: str) -> bool:
+    if value is None:
+        return False
+    value = str(value).lower()
+    if target == "wrn28_10":
+        return value == "wrn28_10" or "wrn" in value
+    return value == target
+
+
+def mean_empirical_mu(configs: list[dict[str, Any]], arch: str, p: float) -> float | None:
+    values = [
+        cfg["empirical_mu"]
+        for cfg in configs
+        if arch_matches(cfg.get("arch"), arch)
+        and close_prob(cfg.get("restore_prob"), p)
+        and cfg.get("empirical_mu") is not None
+        and math.isfinite(cfg["empirical_mu"])
+    ]
+    if not values:
+        return None
+    return float(sum(values) / len(values))
+
+
+def ratio_test(
+    configs: list[dict[str, Any]],
+    name: str,
+    arch: str,
+    p_num: float,
+    p_den: float,
+) -> dict[str, Any]:
+    empirical_num = mean_empirical_mu(configs, arch, p_num)
+    empirical_den = mean_empirical_mu(configs, arch, p_den)
+    empirical_ratio = None
+    if empirical_num is not None and empirical_den not in (None, 0.0):
+        empirical_ratio = empirical_num / empirical_den
+    theory_ratio = ((1.0 - p_num) / p_num) / ((1.0 - p_den) / p_den)
+    return {
+        "name": name,
+        "arch": arch,
+        "p_numerator": p_num,
+        "p_denominator": p_den,
+        "empirical_mu_numerator_mean": empirical_num,
+        "empirical_mu_denominator_mean": empirical_den,
+        "empirical_ratio": empirical_ratio,
+        "theory_ratio": theory_ratio,
+        "available": empirical_ratio is not None,
+    }
+
+
+def compute_ratio_tests(configs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        ratio_test(configs, "resnet18_p005_vs_p025", "resnet18", 0.005, 0.025),
+        ratio_test(configs, "wrn28_10_p01_vs_p02", "wrn28_10", 0.01, 0.02),
+    ]
+
+
 def build_summary_md(payload: dict[str, Any]) -> str:
     configs = payload["configs"]
     lines = [
         "# Dyad Validation",
         "",
         "This descriptive analysis was computed from existing P9 diagnostic JSON files only.",
+        "",
+        "The proxy uses E[||g||], while Theorem 4.5 requires ||E[g]||. Therefore this is an upper-proxy, not the exact theoretical mean drift.",
         "",
         f"- Files matched: {len(payload['files_considered'])}",
         f"- Configs analyzed: {len(configs)}",
@@ -237,7 +307,7 @@ def build_summary_md(payload: dict[str, Any]) -> str:
         ])
     else:
         lines.extend([
-            "| file | arch | seed | p | eta | N | empirical_mu | theoretical_mu | deviation_pct |",
+            "| file | arch | seed | p | eta | N | empirical_mu | theoretical_mu_proxy | deviation_proxy_pct |",
             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ])
         for cfg in configs:
@@ -250,8 +320,28 @@ def build_summary_md(payload: dict[str, Any]) -> str:
                     eta=cfg.get("eta"),
                     N=cfg.get("N"),
                     emu=cfg.get("empirical_mu"),
-                    tmu=cfg.get("theoretical_mu"),
-                    dev=cfg.get("deviation_pct"),
+                    tmu=cfg.get("theoretical_mu_proxy"),
+                    dev=cfg.get("deviation_proxy_pct"),
+                )
+            )
+        lines.append("")
+
+    lines.extend(["## Ratio Tests", ""])
+    ratio_tests = payload.get("ratio_tests", [])
+    if not ratio_tests:
+        lines.extend(["No ratio tests were computed.", ""])
+    else:
+        lines.extend([
+            "| test | empirical_ratio | theory_ratio | available |",
+            "| --- | ---: | ---: | --- |",
+        ])
+        for test in ratio_tests:
+            lines.append(
+                "| {name} | {emp} | {theory} | {available} |".format(
+                    name=test.get("name"),
+                    emp=test.get("empirical_ratio"),
+                    theory=test.get("theory_ratio"),
+                    available=test.get("available"),
                 )
             )
         lines.append("")
@@ -310,6 +400,7 @@ def main() -> None:
     if plot_empirical_vs_theoretical(configs, theory_plot):
         plots.append(str(theory_plot))
 
+    ratio_tests = compute_ratio_tests(configs)
     payload = {
         "patterns": DEFAULT_P9_PATTERNS,
         "matches_by_pattern": matches,
@@ -317,6 +408,7 @@ def main() -> None:
         "skipped_files": skipped_files,
         "warnings": warnings,
         "configs": configs,
+        "ratio_tests": ratio_tests,
         "plots": plots,
     }
     write_json(analysis_dir / "dyad_validation.json", payload)

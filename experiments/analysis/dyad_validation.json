@@ -20,6 +20,30 @@
     "experiments/results/p9_*heat*seed*_sev*.json"
   ],
   "plots": [],
+  "ratio_tests": [
+    {
+      "arch": "resnet18",
+      "available": false,
+      "empirical_mu_denominator_mean": null,
+      "empirical_mu_numerator_mean": null,
+      "empirical_ratio": null,
+      "name": "resnet18_p005_vs_p025",
+      "p_denominator": 0.025,
+      "p_numerator": 0.005,
+      "theory_ratio": 5.102564102564102
+    },
+    {
+      "arch": "wrn28_10",
+      "available": false,
+      "empirical_mu_denominator_mean": null,
+      "empirical_mu_numerator_mean": null,
+      "empirical_ratio": null,
+      "name": "wrn28_10_p01_vs_p02",
+      "p_denominator": 0.02,
+      "p_numerator": 0.01,
+      "theory_ratio": 2.020408163265306
+    }
+  ],
   "skipped_files": [],
   "warnings": [
     "No files matched the P9 diagnostic glob patterns."
