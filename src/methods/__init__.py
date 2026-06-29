@@ -16,11 +16,14 @@ from .tea import TEA, TEANoNoise, TEADirectEnergy
 from .heat import HEAT
 from .epotta import EPOTTA
 from .retta import ReTTA
+from .eata import EATA
+from .sar import SAR
+from .periodic_reset import PeriodicReset
 
 __all__ = [
     "AdaptMethod", "Source", "BNAdapt", "Tent",
     "TEA", "TEANoNoise", "TEADirectEnergy",
-    "HEAT", "EPOTTA", "ReTTA",
+    "HEAT", "EPOTTA", "ReTTA", "EATA", "SAR", "PeriodicReset",
     "select_norm_affine_params", "has_batchnorm", "has_layernorm",
     "NoBatchNormError",
 ]

@@ -88,6 +88,7 @@ class HEAT(AdaptMethod):
         identity_at_match: bool = True,
         update_all_params: bool = True,
         eval_mode: bool = False,
+        bn_running_stats: str = "train",
         update_direction: str = "-grad",
         restore_prob: float = 0.0,
         diagnostic_snapshot: bool = False,
@@ -112,6 +113,11 @@ class HEAT(AdaptMethod):
             raise ValueError(f"update_direction invalid: {update_direction}")
         self.update_direction = update_direction
         self.eval_mode = eval_mode
+        if bn_running_stats not in ("train", "frozen"):
+            raise ValueError(
+                f"bn_running_stats must be 'train' or 'frozen', got {bn_running_stats}"
+            )
+        self.bn_running_stats = bn_running_stats
 
         if restore_prob < 0 or restore_prob > 1:
             raise ValueError(f"restore_prob must be in [0,1], got {restore_prob}")
@@ -180,6 +186,10 @@ class HEAT(AdaptMethod):
             self.model.eval()
         else:
             self.model.train()
+            if self.bn_running_stats == "frozen":
+                for m in self.model.modules():
+                    if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                        m.eval()
 
     def to(self, device):
         self.projections = {l: W.to(device) for l, W in self.projections.items()}
@@ -418,6 +428,7 @@ class HEAT(AdaptMethod):
             "diagnostic_snapshot": self.diagnostic_snapshot,
             "snapshot_scope": "trainable_named_parameters_only",
             "bn_buffers_in_drift": False,
+            "bn_running_stats": self.bn_running_stats,
         }
         diags["stage_grad_norms"] = stage_grad_norms
         # Now safe to apply direction op and update

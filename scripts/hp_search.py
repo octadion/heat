@@ -79,9 +79,18 @@ def parse_args():
                    choices=["sum", "self_gated", "self_gated_temperature"])
     p.add_argument("--update-all-params", action="store_true", default=True)
     p.add_argument("--bn-only", dest="update_all_params", action="store_false")
+    p.add_argument("--heat-adapt-params", type=str, default="full",
+                   choices=["full", "bn_affine_only"],
+                   help="Explicit HEAT/TFF parameter subset. Overrides "
+                        "--bn-only when set to bn_affine_only.")
+    p.add_argument("--heat-bn-running-stats", type=str, default="train",
+                   choices=["train", "frozen"])
     p.add_argument("--eval-modes", type=str, nargs="+", default=None)
     p.add_argument("--restore-prob", type=float, default=0.0,
                    help="HEAT-dyad restore_prob; default 0 = monad.")
+    p.add_argument("--tea-sgld-steps", type=int, default=20)
+    p.add_argument("--tea-sgld-lr", type=float, default=0.1)
+    p.add_argument("--tea-sgld-noise", type=float, default=0.01)
     # Explicit stage selection for HEAT / heat_singlestage. Default (None)
     # means all stages (current HEAT behavior; bit-identical to pre-patch).
     p.add_argument("--heat-stages", type=int, nargs="+", default=None,
@@ -105,14 +114,18 @@ def _clean_root(args) -> str:
 def build_method(variant, base_model, device, lr, args, eval_mode_bool):
     m = copy.deepcopy(base_model).to(device)
     explicit_stages = list(args.heat_stages) if args.heat_stages is not None else None
+    update_all_params = (
+        args.update_all_params and args.heat_adapt_params == "full"
+    )
     if variant == "heat":
         return HEAT(
             m, lr=lr, momentum=0.0,
             stages=explicit_stages,
             temperatures=args.temperatures,
             aggregation=args.aggregation,
-            update_all_params=args.update_all_params,
+            update_all_params=update_all_params,
             eval_mode=eval_mode_bool,
+            bn_running_stats=args.heat_bn_running_stats,
             restore_prob=args.restore_prob,
         ).to(device)
     elif variant == "heat_singlestage":
@@ -127,21 +140,26 @@ def build_method(variant, base_model, device, lr, args, eval_mode_bool):
             stages=stages,
             temperatures=args.temperatures,
             aggregation=args.aggregation,
-            update_all_params=args.update_all_params,
+            update_all_params=update_all_params,
             eval_mode=eval_mode_bool,
+            bn_running_stats=args.heat_bn_running_stats,
             restore_prob=args.restore_prob,
         ).to(device)
     elif variant == "tent":
         return Tent(m, lr=lr, optimizer_name="adam", momentum=0.9)
     elif variant == "tea":
         return TEA(m, lr=lr, optimizer_name="adam",
-                   sgld_steps=20, sgld_lr=0.1)
+                   sgld_steps=args.tea_sgld_steps,
+                   sgld_lr=args.tea_sgld_lr,
+                   sgld_noise=args.tea_sgld_noise)
     elif variant == "tea_nonoise":
         return TEANoNoise(m, lr=lr, optimizer_name="adam",
-                          sgld_steps=20, sgld_lr=0.1)
+                          sgld_steps=args.tea_sgld_steps,
+                          sgld_lr=args.tea_sgld_lr)
     elif variant == "tea_directenergy":
         return TEADirectEnergy(m, lr=lr, optimizer_name="adam",
-                               sgld_steps=20, sgld_lr=0.1)
+                               sgld_steps=args.tea_sgld_steps,
+                               sgld_lr=args.tea_sgld_lr)
     elif variant == "epotta":
         train_loader, _ = get_clean_loaders(
             args.dataset, _clean_root(args),

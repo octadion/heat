@@ -27,7 +27,7 @@ import copy
 import torch
 
 from src.models import resnet18_cifar
-from src.methods import HEAT, Tent, BNAdapt, Source, TEA
+from src.methods import HEAT, Tent, BNAdapt, Source, TEA, EATA, SAR, PeriodicReset
 from src.utils import set_seed, get_device
 
 
@@ -146,6 +146,25 @@ def smoke_baselines():
     n_changed = sum(1 for k in before if not torch.allclose(before[k], after[k]))
     _summary(f"TEA: {n_changed}/{len(before)} BN affine params changed",
              n_changed > 0 and len(before) > 0)
+
+    # EATA smoke: explicit no-Fisher mode for a synthetic check only.
+    model = resnet18_cifar(10).to(device)
+    eata = EATA(model, lr=1e-3, fisher_alpha=0.0)
+    preds = eata.adapt(x)
+    _summary("EATA no-Fisher smoke: preds shape", preds.shape == (8, 10))
+
+    # SAR smoke: reliable entropy + SAM wiring.
+    model = resnet18_cifar(10).to(device)
+    sar = SAR(model, lr=1e-4, reset_ema_threshold=None)
+    preds = sar.adapt(x)
+    _summary("SAR smoke: preds shape", preds.shape == (8, 10))
+
+    # RDumb periodic reset wrapper around Tent.
+    model = resnet18_cifar(10).to(device)
+    rdumb = PeriodicReset(Tent(model, lr=1e-3), reset_interval=1)
+    rdumb.adapt(x)
+    rdumb.adapt(x)
+    _summary("RDumb smoke: reset fired", rdumb.num_resets == 1)
 
     return True
 

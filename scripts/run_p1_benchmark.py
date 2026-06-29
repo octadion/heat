@@ -43,6 +43,7 @@ from src.methods import (
 from src.methods import NoBatchNormError
 from src.adapt import evaluate_online
 from src.utils import set_seed, get_device
+from src.utils.method_factory import build_method as build_method_from_factory
 
 
 def parse_args():
@@ -75,6 +76,14 @@ def parse_args():
                    choices=["adam", "sgd"])
     p.add_argument("--tea-sgld-steps", type=int, default=20)
     p.add_argument("--tea-sgld-lr", type=float, default=0.1)
+    p.add_argument("--tea-sgld-noise", type=float, default=0.01)
+    p.add_argument("--tea-use-buffer", dest="tea_use_buffer",
+                   action="store_true", default=True)
+    p.add_argument("--tea-no-buffer", dest="tea_use_buffer",
+                   action="store_false")
+    p.add_argument("--tea-buffer-size", type=int, default=1000)
+    p.add_argument("--tea-buffer-reinit-prob", type=float, default=0.05)
+    p.add_argument("--tea-entropy-coef", type=float, default=1.0)
     # HEAT
     p.add_argument("--heat-lr", type=float, default=1e-3)
     p.add_argument("--heat-momentum", type=float, default=0.0)
@@ -83,6 +92,10 @@ def parse_args():
     p.add_argument("--heat-aggregation", type=str, default="sum",
                    choices=["sum", "self_gated", "self_gated_temperature"])
     p.add_argument("--heat-restore-prob", type=float, default=0.0)
+    p.add_argument("--heat-adapt-params", type=str, default="full",
+                   choices=["full", "bn_affine_only"])
+    p.add_argument("--heat-bn-running-stats", type=str, default="train",
+                   choices=["train", "frozen"])
     # Optional explicit stage list. Default (None) means "all stages" — i.e.
     # the prior HEAT behavior, bit-identical to before this patch. The
     # heat_singlestage variant defaults to the last stage when this is
@@ -97,6 +110,42 @@ def parse_args():
     # ReTTA
     p.add_argument("--retta-lr", type=float, default=1e-3)
     p.add_argument("--retta-lambda-energy", type=float, default=1.0)
+    # EATA
+    p.add_argument("--eata-lr", type=float, default=5e-3)
+    p.add_argument("--eata-optimizer", type=str, default="sgd",
+                   choices=["sgd", "adam"])
+    p.add_argument("--eata-momentum", type=float, default=0.9)
+    p.add_argument("--eata-e-margin", type=float, default=None)
+    p.add_argument("--eata-d-margin", type=float, default=0.05)
+    p.add_argument("--eata-fisher-alpha", type=float, default=2000.0)
+    p.add_argument("--eata-fisher-samples", type=int, default=2000)
+    p.add_argument("--eata-fisher-split", type=str, default="train",
+                   choices=["train", "test"])
+    # SAR
+    p.add_argument("--sar-lr", type=float, default=2.5e-4)
+    p.add_argument("--sar-momentum", type=float, default=0.9)
+    p.add_argument("--sar-rho", type=float, default=0.05)
+    p.add_argument("--sar-e-margin", type=float, default=None)
+    p.add_argument("--sar-reset-ema-threshold", type=float, default=0.2)
+    p.add_argument("--sar-ema-momentum", type=float, default=0.9)
+    # RDumb / periodic reset
+    p.add_argument("--rdumb-base-method", type=str, default="tent",
+                   choices=["tent", "eata", "sar", "heat", "tea"])
+    p.add_argument("--rdumb-reset-interval", type=int, default=157)
+    p.add_argument("--rdumb-reset-scope", type=str, default="full_model",
+                   choices=["full_model", "trainable_params"])
+    p.add_argument("--rdumb-reset-optimizer-state",
+                   dest="rdumb_reset_optimizer_state",
+                   action="store_true", default=True)
+    p.add_argument("--rdumb-keep-optimizer-state",
+                   dest="rdumb_reset_optimizer_state",
+                   action="store_false")
+    p.add_argument("--rdumb-reset-bn-running-stats",
+                   dest="rdumb_reset_bn_running_stats",
+                   action="store_true", default=True)
+    p.add_argument("--rdumb-keep-bn-running-stats",
+                   dest="rdumb_reset_bn_running_stats",
+                   action="store_false")
 
     p.add_argument("--out-dir", type=str, default="experiments/results")
     p.add_argument("--variant-tag", type=str, default="")
@@ -121,6 +170,13 @@ def load_model(arch, checkpoint_path, device, num_classes):
 
 
 def build_method(name, base_model, device, args):
+    return build_method_from_factory(
+        name,
+        base_model,
+        device,
+        args,
+        dataset_root=_clean_root(args),
+    )
     model = copy.deepcopy(base_model).to(device)
     if name == "source":
         return Source(model)
