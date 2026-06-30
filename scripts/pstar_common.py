@@ -200,8 +200,16 @@ def discover_etas(results_dir, arch: str, severity: int, seed: int) -> list[floa
 # ----------------------------------------------------------------------------
 
 def _scale(values: Sequence[float], eta: float) -> list[float]:
+    """Scale p-values by eta/ETA, dropping any that exceed 1.0 (a restore_prob
+    must be in [0,1]; at very high eta the scaled ladder/grid can exceed 1, which
+    HEAT would reject). Values <= 1 are kept; this never affects eta <= 4e-3."""
     factor = float(eta) / ETA
-    return [round(v * factor, 8) for v in values]
+    out = []
+    for v in values:
+        sv = round(v * factor, 8)
+        if 0.0 <= sv <= 1.0:
+            out.append(sv)
+    return out
 
 
 def scaled_p_grid(eta: float, base: Optional[Sequence[float]] = None) -> list[float]:
@@ -357,6 +365,67 @@ def first_nonfinite_step(rows: Sequence[dict[str, Any]]) -> Optional[int]:
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def first_nonfinite_info(rows: Sequence[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """First-NaN row's global step, local_step (within-block), and corruption.
+    None if the stream never diverges."""
+    ordered = sorted(rows, key=lambda r: (r.get("step") if r.get("step") is not None else 1 << 60))
+    for r in ordered:
+        if _row_nonfinite(r):
+            def _i(v):
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return None
+            return {"step": _i(r.get("step")), "local_step": _i(r.get("local_step")),
+                    "corruption": r.get("corruption")}
+    return None
+
+
+# First-block length (~157 batches/corruption). A NaN here = divergence before
+# any sustained cross-corruption adaptation -> optimizer-blowup signal.
+FIRST_BLOCK_STEPS = 157
+CONFOUND_GBAR_RATIO = 2.0
+
+
+def confound_flag(
+    p0_data: Optional[dict[str, Any]],
+    gbar_pref_eta: Optional[float],
+    gbar_baseline: Optional[float],
+) -> dict[str, Any]:
+    """Distinguish genuine drift-collapse from optimizer (LR) blow-up at high eta.
+
+    Inspects the no-tether (p=0) trajectory. Returns {flag, first_nan_step,
+    first_nan_local, gbar_ratio, early, inflated} where flag is one of:
+      'no_hard_collapse'  -- p=0 never diverges (no hard boundary at this eta)
+      'optimizer_blowup'  -- divergence within the FIRST block (step < ~157), OR
+                             ||g_bar|| at p_ref > 2x its eta=1e-3 value (the LR
+                             itself is unstable, not drift). NOT valid for the
+                             slope test.
+      'genuine'           -- divergence after sustained adaptation (later block)
+                             with a bounded early ||g_bar||, matching the WRN
+                             drift pattern. Valid for the slope test.
+    """
+    info = first_nonfinite_info(stream_rows(p0_data)) if p0_data else None
+    ratio = None
+    if gbar_pref_eta is not None and gbar_baseline:
+        ratio = gbar_pref_eta / gbar_baseline
+    inflated = ratio is not None and ratio > CONFOUND_GBAR_RATIO
+
+    if info is None:
+        # No NaN in the most-aggressive (p=0) run -> no hard boundary here. If the
+        # reference gradient is already inflated we still surface it.
+        return {"flag": ("optimizer_blowup" if inflated else "no_hard_collapse"),
+                "first_nan_step": None, "first_nan_local": None,
+                "gbar_ratio": ratio, "early": False, "inflated": inflated}
+
+    glob = info.get("step")
+    early = glob is not None and glob < FIRST_BLOCK_STEPS
+    flag = "optimizer_blowup" if (early or inflated) else "genuine"
+    return {"flag": flag, "first_nan_step": glob,
+            "first_nan_local": info.get("local_step"),
+            "gbar_ratio": ratio, "early": early, "inflated": inflated}
 
 
 def _block_stationary_mean(rows: Sequence[dict[str, Any]], key: str) -> Optional[tuple[float, int, int]]:
@@ -582,6 +651,8 @@ __all__ = [
     "source_mean_acc",
     "stream_rows",
     "first_nonfinite_step",
+    "first_nonfinite_info",
+    "confound_flag",
     "grad_norm_gbar",
     "drift_stationary",
     "heat_lr_of",

@@ -69,6 +69,12 @@ def parse_args():
                    help="Output basename for the hard-only artifacts (used by "
                         "--hard-only and --compare-hardonly). E.g. "
                         "'pstar_law_hardonly_pooled' for a pooled wrn+resnet re-check.")
+    p.add_argument("--hard-refine-arch", type=str, default="",
+                   help="Run the hard-boundary refinement test for this arch "
+                        "(e.g. resnet18): per-eta p*(soft) vs p*(hard) with a "
+                        "confound flag (genuine drift-collapse vs optimizer "
+                        "blow-up), fit the genuine-drift hard points, and print a "
+                        "CONFIRMED / SLOPE-MISMATCH / NOT-TRIGGERABLE conclusion.")
     return p.parse_args()
 
 
@@ -482,6 +488,94 @@ def print_comparison(soft_rows, soft_fit, hard_rows, hard_fit, archs):
               "the soft+hard fit to judge whether the law still holds cleanly.")
 
 
+def refine_hard_arch(results_dir, seed, arch, severities):
+    """Hard-boundary refinement test for a wide-basin arch (e.g. resnet18).
+
+    Per eta: p*(soft) vs p*(hard), the hard collapse_criterion, and a confound
+    flag (genuine drift-collapse vs optimizer blow-up, judged from the p=0
+    trajectory + the p_ref ||g_bar|| ratio vs eta=1e-3). Fits the GENUINE-drift
+    hard points only and prints a 3-way conclusion vs the soft line's slope.
+    """
+    sev = severities[0]
+    print(f"\n================ HARD-BOUNDARY REFINEMENT: {arch} sev{sev} "
+          f"================\n")
+
+    # Baseline: ||g_bar|| at the eta=1e-3 reference (for the confound ratio).
+    _, _, gbar_base = derive_pref(results_dir, arch, sev, seed, 1e-3, None)
+    print(f"baseline ||g_bar|| at eta=1e-3 p_ref: {gbar_base if gbar_base else 'n/a'}")
+
+    etas = pc.discover_etas(results_dir, arch, sev, seed)
+    soft_pts, hard_pts_genuine = [], []
+    rows = []
+    for eta in sorted(etas):
+        soft = analyze_cell(results_dir, arch, sev, eta, seed, hard_only=False)
+        hard = analyze_cell(results_dir, arch, sev, eta, seed, hard_only=True)
+        p0 = load_p_run(results_dir, arch, sev, seed, 0.0, eta)
+        cf = pc.confound_flag(p0, hard["grad_norm_gbar"], gbar_base)
+        rows.append((eta, soft, hard, cf))
+        # The "soft line" is fit over GENUINELY soft-bounded cells only (boundary
+        # = soft:*). Cells bounded by a hard NaN (the extended high-eta points)
+        # or with p*~0 are excluded -- otherwise the extended hard points would
+        # pull the very soft line we compare them against.
+        if (soft["eta_times_gbar"] is not None and soft["p_star"] is not None
+                and str(soft["collapse_criterion"]).startswith("soft:")):
+            soft_pts.append((soft["eta_times_gbar"], soft["p_star"]))
+        if (cf["flag"] == "genuine" and hard["p_star"] not in (None, 0, 0.0)
+                and hard["eta_times_gbar"] is not None):
+            hard_pts_genuine.append((hard["eta_times_gbar"], hard["p_star"]))
+
+    cols = ["eta", "p*(soft)", "p*(hard)", "crit(hard)", "confound",
+            "first_nan_step", "gbar_ratio"]
+    print("| " + " | ".join(cols) + " |")
+    print("| " + " | ".join("---" for _ in cols) + " |")
+    def f(v):
+        return "n/a" if v is None else (f"{v:.5g}" if isinstance(v, float) else str(v))
+    for eta, soft, hard, cf in rows:
+        print("| " + " | ".join([
+            f"{eta:g}", f(soft["p_star"]), f(hard["p_star"]),
+            str(hard["collapse_criterion"]), cf["flag"],
+            f(cf["first_nan_step"]), f(cf["gbar_ratio"]),
+        ]) + " |")
+
+    soft_fit = pc.least_squares_line([x for x, _ in soft_pts], [y for _, y in soft_pts])
+    hard_fit = pc.least_squares_line([x for x, _ in hard_pts_genuine],
+                                     [y for _, y in hard_pts_genuine])
+    soft_slope = soft_fit["slope"] if soft_fit else None
+    print(f"\nsoft line:           slope={f(soft_slope)}"
+          + (f" (R={1.0/soft_slope:.4g}, R²={soft_fit['r2']:.4f})" if soft_fit else ""))
+    if hard_fit:
+        hs = hard_fit["slope"]
+        print(f"hard line (genuine): slope={hs:.4g} (R={1.0/hs:.4g}, "
+              f"intercept={hard_fit['intercept']:.3g}, R²={hard_fit['r2']:.4f}) "
+              f"on {len(hard_pts_genuine)} genuine point(s)")
+    else:
+        print(f"hard line (genuine): n/a -- only {len(hard_pts_genuine)} genuine "
+              f"drift-collapse point(s) (need >=2 to fit)")
+
+    # 3-way conclusion.
+    print()
+    if hard_fit and soft_slope:
+        rel = abs(hard_fit["slope"] - soft_slope) / abs(soft_slope)
+        if rel <= 0.20:
+            print(f"CONCLUSION: CONFIRMED — {arch} hard-criterion p* fall on the same "
+                  f"slope as the soft line (Δslope={rel*100:.0f}% ≤ 20%). The second R "
+                  f"is robust under the hard criterion.")
+        else:
+            print(f"CONCLUSION: SLOPE-MISMATCH — {arch} hard-collapses but on a "
+                  f"different slope (hard={hard_fit['slope']:.4g} vs soft="
+                  f"{soft_slope:.4g}, Δ={rel*100:.0f}%). Soft and hard measure "
+                  f"different boundaries for this wide-basin arch; report both.")
+    else:
+        n_blow = sum(1 for _e, _s, _h, cf in rows if cf["flag"] == "optimizer_blowup")
+        n_none = sum(1 for _e, _s, _h, cf in rows if cf["flag"] == "no_hard_collapse")
+        print(f"CONCLUSION: NOT-TRIGGERABLE — {arch} reached <2 genuine drift-collapse "
+              f"points at sev{sev} ({n_blow} optimizer-blowup, {n_none} no-hard-collapse). "
+              f"Exposing a clean hard boundary for this wide-basin architecture needs a "
+              f"stronger shift than CIFAR-10-C severity provides (motivates DomainNet). "
+              f"The soft line (slope={f(soft_slope)}) stands as the best available "
+              f"estimate of {arch}'s R.")
+
+
 def main():
     # Console prints contain non-ASCII (R², η); force UTF-8 stdout so a cp1252
     # locale / piped shell can't crash the run. (Colab is already UTF-8.)
@@ -526,6 +620,11 @@ def main():
         print_comparison(all_rows, per_arch_fit, hard_rows, hard_fit, args.archs)
         for n in (f"{hb}.json", f"{hb}.png", f"{hb}.md"):
             print(f"[saved] {analysis_dir / n}")
+
+    # Hard-boundary refinement test for a wide-basin arch (e.g. resnet18).
+    if args.hard_refine_arch:
+        refine_hard_arch(results_dir, args.seed, args.hard_refine_arch,
+                         args.severities)
 
 
 if __name__ == "__main__":

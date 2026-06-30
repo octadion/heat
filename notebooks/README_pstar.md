@@ -197,6 +197,41 @@ flat, the sweep **auto-escalates** with 2 stronger etas (`--eta-escalate-values 
 1.6e-2`, capped at 2 runs) to push past the collapse boundary and reveal the slope; this
 is logged as `[escalate]`.
 
+**Phase C — ResNet hard-boundary refinement.** If ResNet's soft line is clean but it never
+*hard*-collapses across the η grid (p\*_hard = 0 everywhere), push η further to try to
+trigger a genuine hard boundary and test whether those hard p\* fall on the soft slope:
+
+```bash
+# extend the resnet eta-sweep upward (descending), then refine-report
+python scripts/run_pstar_sweep.py --results-dir <DIR> --c10c-root data/cifar10c \
+    --archs resnet18 --severities 5 --etas 8e-3 1.6e-2 3.2e-2 --eta-order desc \
+    --p-grid 0.0 0.005 0.010 0.020 --bisect-steps 3 --ckpt-resnet18 <resnet.pt>
+python scripts/analyze_pstar_law.py --results-dir <DIR> --archs wrn28_10 resnet18 \
+    --severities 5 --hard-refine-arch resnet18
+```
+
+`--hard-refine-arch resnet18` prints, per η: `p*(soft)` vs `p*(hard)`, the hard
+`collapse_criterion`, and a **confound flag**. The confound guard distinguishes a genuine
+drift-collapse from optimizer/LR blow-up at high η, judged from the no-tether (p=0)
+trajectory + the reference ‖ḡ‖:
+
+- **optimizer-blowup** — first NaN within the first block (step < ~157), OR p_ref ‖ḡ‖
+  > 2× its η=1e-3 value (the step size itself is unstable). **Excluded** from the slope fit.
+- **genuine** — NaN appears after sustained adaptation (later block) with bounded early
+  ‖ḡ‖, matching the WRN pattern. **Only these** enter the hard fit.
+
+It then fits the genuine-drift hard p\* and prints one of three conclusions:
+- **CONFIRMED** — hard slope within ~20% of the soft slope: the second R is robust under
+  the hard criterion.
+- **SLOPE-MISMATCH** — hard collapses but on a different slope: soft and hard measure
+  different boundaries for this wide-basin arch (reports both).
+- **NOT-TRIGGERABLE** — only blow-up / no hard collapse: a clean hard boundary needs a
+  stronger shift than CIFAR-10-C severity provides (motivates DomainNet); the soft line
+  stands as ResNet's best R estimate.
+
+(Safety: at very high η the eta-scaled p-grid/ladder is clamped to drop values > 1, since
+`restore_prob` must be in [0,1]. Unaffected for η ≤ 4e-3.)
+
 ---
 
 ## Troubleshooting
