@@ -57,6 +57,14 @@ def parse_args():
                    help="Learning rates to include. Default: auto-discover every "
                         "eta with runs on disk for each (arch, severity).")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--hard-only", action="store_true",
+                   help="Treat ONLY hard collapse (NaN/inf or chance acc) as "
+                        "collapse; ignore soft:below_source / soft:drift_blowup. "
+                        "Writes pstar_law_hardonly.* (default artifacts preserved).")
+    p.add_argument("--compare-hardonly", action="store_true",
+                   help="Run BOTH the default (soft+hard) and hard-only analyses, "
+                        "write both artifact sets, and print a per-eta side-by-side "
+                        "comparison + refit slopes. (No new runs; re-analysis only.)")
     return p.parse_args()
 
 
@@ -70,12 +78,13 @@ def load_p_run(results_dir, arch, severity, seed, p, eta):
         return None
 
 
-def derive_pref(results_dir, arch, severity, seed, eta, source_acc):
+def derive_pref(results_dir, arch, severity, seed, eta, source_acc, hard_only=False):
     """Read-only re-derivation of the reference p_ref (mirrors the sweep).
 
     Uses the eta-SCALED ladder and eta-tagged paths. Stability uses hard
     collapse + below-source only (the drift-ratio test is defined relative to
-    p_ref). Returns (p_ref, pref_drift, gbar)."""
+    p_ref). With hard_only, only hard collapse disqualifies a reference.
+    Returns (p_ref, pref_drift, gbar)."""
     candidates = pc.scaled_pref_ladder(arch, eta)
     last = (None, None, None)
     for cand in candidates:
@@ -87,13 +96,13 @@ def derive_pref(results_dir, arch, severity, seed, eta, source_acc):
         drift = pc.drift_stationary(data)
         last = (cand, drift, gbar)
         v = pc.classify_run(data, source_acc, pref_drift=None,
-                            use_drift_criterion=False)
+                            use_drift_criterion=False, hard_only=hard_only)
         if not v["collapsed"]:
             return cand, drift, gbar
     return last  # no stable reference found; best effort
 
 
-def analyze_cell(results_dir, arch, severity, eta, seed):
+def analyze_cell(results_dir, arch, severity, eta, seed, hard_only=False):
     """Build the full row for one (arch, severity, eta) cell."""
     src_path = pc.run_output_path(results_dir, arch, severity, seed,
                                   source=True, eta=eta)
@@ -105,7 +114,7 @@ def analyze_cell(results_dir, arch, severity, eta, seed):
             source_acc = None
 
     p_ref, pref_drift, gbar = derive_pref(results_dir, arch, severity, seed,
-                                          eta, source_acc)
+                                          eta, source_acc, hard_only=hard_only)
 
     p_values = pc.discover_p_values(results_dir, arch, severity, seed, eta)
     points = []
@@ -120,7 +129,7 @@ def analyze_cell(results_dir, arch, severity, eta, seed):
         # x-axis uses the run's OWN eta (CHANGE A), not the hardcoded pc.ETA.
         if eta_used is None:
             eta_used = pc.heat_lr_of(data)
-        v = pc.classify_run(data, source_acc, pref_drift)
+        v = pc.classify_run(data, source_acc, pref_drift, hard_only=hard_only)
         points.append({"p": p, "collapsed": v["collapsed"], "valid": True})
         criteria[p] = v["criterion"]
         if v["mean_acc"] is not None:
@@ -361,35 +370,32 @@ def print_table(rows: list[dict]):
         print("| " + " | ".join(fmt(r.get(c)) for c in cols) + " |")
 
 
-def main():
-    args = parse_args()
-    results_dir = Path(args.results_dir)
-    analysis_dir = results_dir / "analysis"
-    analysis_dir.mkdir(parents=True, exist_ok=True)
-
-    all_rows = []
-    for arch in args.archs:
-        for sev in args.severities:
-            # Each (arch, severity, eta) is its own p* cell. Use the explicit
-            # --etas if given, else auto-discover every eta with runs on disk.
-            etas = args.etas if args.etas else pc.discover_etas(
-                results_dir, arch, sev, args.seed)
-            for eta in sorted(set(etas)):
-                row = analyze_cell(results_dir, arch, sev, eta, args.seed)
-                all_rows.append(row)
-
-    # Per-arch fits.
+def _fit_per_arch(all_rows, archs):
     per_arch_fit = {}
-    for arch in args.archs:
+    for arch in archs:
         rows = [r for r in all_rows if r["arch"] == arch]
         fit, xs, ys, usable = fit_arch(rows)
         per_arch_fit[arch] = {"fit": fit, "xs": xs, "ys": ys, "rows": usable,
                               "all_rows": rows}
+    return per_arch_fit
 
-    make_plot(per_arch_fit, analysis_dir / "pstar_law.png")
-    verdict, verdict_md = build_verdict(per_arch_fit, all_rows)
 
-    # Write artifacts.
+def analyze_all(results_dir, args, hard_only):
+    """Build all (arch, severity, eta) rows + per-arch fits for one mode."""
+    all_rows = []
+    for arch in args.archs:
+        for sev in args.severities:
+            etas = args.etas if args.etas else pc.discover_etas(
+                results_dir, arch, sev, args.seed)
+            for eta in sorted(set(etas)):
+                all_rows.append(analyze_cell(results_dir, arch, sev, eta,
+                                             args.seed, hard_only=hard_only))
+    return all_rows, _fit_per_arch(all_rows, args.archs)
+
+
+def write_artifacts(analysis_dir, json_name, png_name, md_name, archs,
+                    all_rows, per_arch_fit, verdict, verdict_md):
+    make_plot(per_arch_fit, analysis_dir / png_name)
     law_json = {
         "etas": sorted({r["eta"] for r in all_rows if r.get("eta") is not None}),
         "r2_good_threshold": R2_GOOD,
@@ -403,22 +409,121 @@ def main():
                 "r2": per_arch_fit[arch]["fit"]["r2"],
                 "n_points": per_arch_fit[arch]["fit"]["n"],
             })
-            for arch in args.archs
+            for arch in archs
         },
         "verdict": verdict,
     }
-    (analysis_dir / "pstar_law.json").write_text(
+    (analysis_dir / json_name).write_text(
         json.dumps(law_json, indent=2), encoding="utf-8")
-    (analysis_dir / "pstar_verdict.md").write_text(verdict_md, encoding="utf-8")
+    (analysis_dir / md_name).write_text(verdict_md, encoding="utf-8")
 
-    # Console output (notebook displays these).
-    print("\n================ p* DRIFT-BUDGET LAW: TABLE ================\n")
+
+def _fitline(fit):
+    if fit is None:
+        return "n/a (need >=2 pts)"
+    slope = fit["slope"]
+    R = (1.0 / slope) if slope else float("inf")
+    r2 = fit["r2"]
+    return (f"slope={slope:.4g} (R={R:.4g}) b={fit['intercept']:.3g} "
+            f"R²={r2:.4f}" if r2 is not None else f"slope={slope:.4g}")
+
+
+def print_comparison(soft_rows, soft_fit, hard_rows, hard_fit, archs):
+    """Side-by-side soft+hard vs hard-only, per (arch, eta), + refit lines."""
+    def key(r):
+        return (r["arch"], round(r["eta"], 8))
+    hmap = {key(r): r for r in hard_rows}
+
+    print("\n================ STEP 1: SOFT+HARD vs HARD-ONLY ================\n")
+    cols = ["arch", "eta", "p*(soft+hard)", "crit(soft+hard)",
+            "p*(hard-only)", "crit(hard-only)", "moved?"]
+    print("| " + " | ".join(cols) + " |")
+    print("| " + " | ".join("---" for _ in cols) + " |")
+
+    def fp(v):
+        return "n/a" if v is None else (f"{v:.5g}" if isinstance(v, float) else str(v))
+
+    moved_any = []
+    for r in soft_rows:
+        h = hmap.get(key(r))
+        ps, ph = r.get("p_star"), (h.get("p_star") if h else None)
+        moved = ""
+        if ps is not None and ph is not None:
+            d = abs(ps - ph)
+            moved = "yes" if d > 0.0005 else "~same"
+            if d > 0.0005:
+                moved_any.append((r["arch"], r["eta"], ps, ph))
+        elif ps != ph:
+            moved = "yes"; moved_any.append((r["arch"], r["eta"], ps, ph))
+        print("| " + " | ".join([
+            r["arch"], f"{r['eta']:g}", fp(ps), str(r.get("collapse_criterion")),
+            fp(ph), str(h.get("collapse_criterion") if h else "n/a"), moved,
+        ]) + " |")
+
+    print("\nRefit (slope=1/R, through ~origin):")
+    for arch in archs:
+        print(f"  {arch:10s}  soft+hard: {_fitline(soft_fit[arch]['fit'])}")
+        print(f"  {arch:10s}  hard-only: {_fitline(hard_fit[arch]['fit'])}")
+
+    print("\nInterpretation:")
+    if not moved_any:
+        print("  Hard-only p* matches soft+hard at every point: the line is ROBUST "
+              "to the criterion — the soft criterion was not shaping it.")
+    else:
+        pts = ", ".join(f"{a} eta={e:g} ({fp(ps)}->{fp(ph)})"
+                        for a, e, ps, ph in moved_any)
+        print(f"  Points moved under hard-only: {pts}.")
+        print("  Those p* were SHAPED by the soft criterion; the clean (hard-only) "
+              "fit above is the signal to trust. Compare its slope/R²/intercept to "
+              "the soft+hard fit to judge whether the law still holds cleanly.")
+
+
+def main():
+    # Console prints contain non-ASCII (R², η); force UTF-8 stdout so a cp1252
+    # locale / piped shell can't crash the run. (Colab is already UTF-8.)
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    args = parse_args()
+    results_dir = Path(args.results_dir)
+    analysis_dir = results_dir / "analysis"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    # Primary pass: hard-only if --hard-only (and not comparing), else default.
+    primary_hard = args.hard_only and not args.compare_hardonly
+    if primary_hard:
+        names = ("pstar_law_hardonly.json", "pstar_law_hardonly.png",
+                 "pstar_law_hardonly.md")
+    else:
+        # Default artifact names -- what the notebook displays. Preserved exactly.
+        names = ("pstar_law.json", "pstar_law.png", "pstar_verdict.md")
+
+    all_rows, per_arch_fit = analyze_all(results_dir, args, hard_only=primary_hard)
+    verdict, verdict_md = build_verdict(per_arch_fit, all_rows)
+    write_artifacts(analysis_dir, *names, args.archs, all_rows, per_arch_fit,
+                    verdict, verdict_md)
+
+    print("\n================ p* DRIFT-BUDGET LAW: TABLE "
+          f"({'HARD-ONLY' if primary_hard else 'soft+hard'}) ================\n")
     print_table(all_rows)
     print("\n================ VERDICT ================\n")
     print(verdict_md)
-    print(f"\n[saved] {analysis_dir / 'pstar_law.json'}")
-    print(f"[saved] {analysis_dir / 'pstar_law.png'}")
-    print(f"[saved] {analysis_dir / 'pstar_verdict.md'}")
+    for name in names:
+        print(f"[saved] {analysis_dir / name}")
+
+    # Comparison mode: also run hard-only, write its artifacts, print side-by-side.
+    if args.compare_hardonly:
+        hard_rows, hard_fit = analyze_all(results_dir, args, hard_only=True)
+        hverdict, hverdict_md = build_verdict(hard_fit, hard_rows)
+        write_artifacts(analysis_dir, "pstar_law_hardonly.json",
+                        "pstar_law_hardonly.png", "pstar_law_hardonly.md",
+                        args.archs, hard_rows, hard_fit, hverdict, hverdict_md)
+        print_comparison(all_rows, per_arch_fit, hard_rows, hard_fit, args.archs)
+        for n in ("pstar_law_hardonly.json", "pstar_law_hardonly.png",
+                  "pstar_law_hardonly.md"):
+            print(f"[saved] {analysis_dir / n}")
 
 
 if __name__ == "__main__":

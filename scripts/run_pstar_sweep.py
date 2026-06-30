@@ -81,6 +81,15 @@ def parse_args():
                    default=[2e-4, 5e-4, 1e-3, 2e-3, 4e-3],
                    help="Learning rates to sweep (the x-axis lever). Each (arch, "
                         "severity, eta) is its own p* cell.")
+    p.add_argument("--eta-order", type=str, default="asc",
+                   choices=["asc", "desc"],
+                   help="Order etas ascending or descending. Use 'desc' for "
+                        "ResNet (highest-signal/most-likely-hard points first).")
+    p.add_argument("--eta-escalate-values", type=float, nargs="*", default=[],
+                   help="If ALL base-eta cells for an (arch, severity) give "
+                        "p*~=0 (basin too wide to collapse), additionally run "
+                        "these stronger etas to push past the collapse boundary. "
+                        "Capped at 2 extra runs/cell.")
     p.add_argument("--bisect-steps", type=int, default=3,
                    help="Bisections of the stable/collapse bracket (default 3 for "
                         "the eta-sweep, whose predicted p* spread is large).")
@@ -417,15 +426,17 @@ def main():
         sys.exit(run_sanity_check(args))
 
     sev_map = {arch: _severities_for(arch, args) for arch in args.archs}
-    etas = sorted(set(args.etas))
+    etas = sorted(set(args.etas), reverse=(args.eta_order == "desc"))
+    escalate = [round(float(e), 8) for e in (args.eta_escalate_values or [])][:2]
     print(f"[sweep] results_dir={args.results_dir}", flush=True)
     print(f"[sweep] archs={args.archs} severities(by arch)={sev_map} "
-          f"etas={[pc.format_p(e) for e in etas]} "
+          f"etas({args.eta_order})={[pc.format_p(e) for e in etas]} "
+          f"escalate_etas={[pc.format_p(e) for e in escalate]} "
           f"base_p_grid={[pc.format_p(p) for p in args.p_grid]} "
           f"bisect_steps={args.bisect_steps} seed={args.seed}", flush=True)
     n_cells = sum(len(v) for v in sev_map.values()) * len(etas)
-    print(f"[sweep] {n_cells} (arch,severity,eta) cells. resnet18 first; "
-          f"within an arch, severity then eta in configured order.", flush=True)
+    print(f"[sweep] {n_cells} base (arch,severity,eta) cells. resnet18 first; "
+          f"within an arch, severity then eta in {args.eta_order} order.", flush=True)
 
     # resnet18 (cheaper) first; then severity, then eta -- so partial progress
     # (an early eta's p* point) is useful even if cut off.
@@ -435,8 +446,26 @@ def main():
     for arch in arch_order:
         ckpt = _ckpt_for(arch, args)
         for sev in sev_map[arch]:
+            cell_summaries = []
             for eta in etas:
-                summaries.append(sweep_cell(args, arch, sev, eta, ckpt, log_prefix=""))
+                s = sweep_cell(args, arch, sev, eta, ckpt, log_prefix="")
+                cell_summaries.append(s)
+                summaries.append(s)
+            # Auto-escalation: if the basin is too wide to collapse (every base
+            # eta gives p*~=0), push with stronger etas so the slope is visible.
+            if escalate:
+                resolved = [s for s in cell_summaries if s["p_star"] is not None]
+                flat = bool(resolved) and all(s["p_star"] <= 1e-6 for s in resolved)
+                if flat:
+                    print(f"\n[escalate] {arch} sev{sev}: all base etas give p*~=0 "
+                          f"(basin too wide). Running stronger etas "
+                          f"{[pc.format_p(e) for e in escalate]} (cap 2).", flush=True)
+                    for eta in escalate:
+                        s = sweep_cell(args, arch, sev, eta, ckpt, log_prefix="")
+                        summaries.append(s)
+                else:
+                    print(f"\n[escalate] {arch} sev{sev}: base etas already show "
+                          f"non-zero p* -- no escalation needed.", flush=True)
 
     print(f"\n[sweep] done in {time.time() - t_start:.1f}s. "
           f"Run scripts/analyze_pstar_law.py for the verdict.", flush=True)

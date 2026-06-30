@@ -404,6 +404,7 @@ def classify_run(
     source_acc: Optional[float],
     pref_drift: Optional[float],
     use_drift_criterion: bool = True,
+    hard_only: bool = False,
 ) -> dict[str, Any]:
     """Return {collapsed, criterion, mean_acc, last_acc, drift, gbar}.
 
@@ -417,6 +418,10 @@ def classify_run(
     `use_drift_criterion=False` disables the drift-ratio test; used when
     selecting p_ref itself (whose drift defines the ratio, so it can't be
     compared against itself).
+
+    `hard_only=True` ignores BOTH soft criteria entirely -- only hard collapse
+    counts as collapse. Used to confirm the p* line is not an artifact of the
+    soft criterion (a soft-bounded run then counts as stable).
     """
     summ = heat_summary(data)
     rows = stream_rows(data)
@@ -435,7 +440,7 @@ def classify_run(
         "gbar": gbar,
     }
 
-    # 1. Hard collapse.
+    # 1. Hard collapse (always applies).
     if any(_row_nonfinite(r) for r in rows):
         out["collapsed"] = True
         out["criterion"] = "hard:nan_inf"
@@ -445,6 +450,10 @@ def classify_run(
     if mean_acc is None or mean_acc <= CHANCE_ACC:
         out["collapsed"] = True
         out["criterion"] = "hard:chance_acc"
+        return out
+
+    # Hard-only mode: stop here, soft instabilities do not count as collapse.
+    if hard_only:
         return out
 
     # 2. Soft instability.

@@ -131,6 +131,8 @@ and save the checkpoint to Drive.
 - Any p\* point whose collapsing edge was a **soft** criterion (`soft:below_source` /
   `soft:drift_blowup`) is flagged in the verdict as a possible confound; for WRN sev5 the
   boundary should normally be `hard:nan_inf`.
+- **`pstar_law_hardonly.{json,png,md}`** — only when `--hard-only`/`--compare-hardonly` is
+  used (Step 1). Same schema, hard-criterion-only p\*.
 
 The plot and verdict also display inline at the bottom of the notebook.
 
@@ -164,6 +166,36 @@ The plot and verdict also display inline at the bottom of the notebook.
 
 **No p-hacking:** all points are reported and the fit spans all of them. The analysis
 script is the single source of truth and recomputes p\* from every run on disk.
+
+---
+
+## Validation: hard-only re-check (Step 1) & Phase B (second arch)
+
+**Step 1 — hard-only re-check (zero GPU, re-analysis only).** If the verdict flags that
+some p\* boundaries were set by a **soft** criterion (`soft:below_source` /
+`soft:drift_blowup`) rather than `hard:nan_inf`, confirm the line isn't an artifact:
+
+```bash
+python scripts/analyze_pstar_law.py --results-dir <DIR> --archs wrn28_10 \
+    --severities 5 --compare-hardonly
+```
+
+This re-reads the existing JSONs under both criteria and prints a per-η side-by-side
+(`p*(soft+hard)` vs `p*(hard-only)`, with `moved?`) plus a refit slope/R/intercept/R² for
+each. `--hard-only` treats only NaN/inf or chance-accuracy as collapse (soft instabilities
+count as stable). Outputs go to `analysis/pstar_law_hardonly.{json,png,md}` — the default
+artifacts are preserved. *Reading it:* if the hard-only line stays linear through ~origin
+with a similar slope, the law is **robust** to the criterion; if low-η points move a lot,
+the soft criterion was shaping them and the **hard-only fit is the clean signal**.
+
+**Phase B — second architecture.** Add `resnet18` to `ARCHS` (sev5, same η grid). The
+sweep processes ResNet with `--eta-order desc` (highest-signal points first) and pools both
+archs on **one plot** (two series, two slopes 1/R) — the per-architecture-R evidence.
+ResNet has a broad stable basin, so at sev5 it may not collapse at low η (**p\*≈0**, a
+floor — consistent with a large R, not a refutation). If the *entire* ResNet η grid is
+flat, the sweep **auto-escalates** with 2 stronger etas (`--eta-escalate-values 8e-3
+1.6e-2`, capped at 2 runs) to push past the collapse boundary and reveal the slope; this
+is logged as `[escalate]`.
 
 ---
 
