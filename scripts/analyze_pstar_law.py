@@ -65,6 +65,10 @@ def parse_args():
                    help="Run BOTH the default (soft+hard) and hard-only analyses, "
                         "write both artifact sets, and print a per-eta side-by-side "
                         "comparison + refit slopes. (No new runs; re-analysis only.)")
+    p.add_argument("--hardonly-basename", type=str, default="pstar_law_hardonly",
+                   help="Output basename for the hard-only artifacts (used by "
+                        "--hard-only and --compare-hardonly). E.g. "
+                        "'pstar_law_hardonly_pooled' for a pooled wrn+resnet re-check.")
     return p.parse_args()
 
 
@@ -493,9 +497,9 @@ def main():
 
     # Primary pass: hard-only if --hard-only (and not comparing), else default.
     primary_hard = args.hard_only and not args.compare_hardonly
+    hb = args.hardonly_basename
     if primary_hard:
-        names = ("pstar_law_hardonly.json", "pstar_law_hardonly.png",
-                 "pstar_law_hardonly.md")
+        names = (f"{hb}.json", f"{hb}.png", f"{hb}.md")
     else:
         # Default artifact names -- what the notebook displays. Preserved exactly.
         names = ("pstar_law.json", "pstar_law.png", "pstar_verdict.md")
@@ -517,12 +521,10 @@ def main():
     if args.compare_hardonly:
         hard_rows, hard_fit = analyze_all(results_dir, args, hard_only=True)
         hverdict, hverdict_md = build_verdict(hard_fit, hard_rows)
-        write_artifacts(analysis_dir, "pstar_law_hardonly.json",
-                        "pstar_law_hardonly.png", "pstar_law_hardonly.md",
+        write_artifacts(analysis_dir, f"{hb}.json", f"{hb}.png", f"{hb}.md",
                         args.archs, hard_rows, hard_fit, hverdict, hverdict_md)
         print_comparison(all_rows, per_arch_fit, hard_rows, hard_fit, args.archs)
-        for n in ("pstar_law_hardonly.json", "pstar_law_hardonly.png",
-                  "pstar_law_hardonly.md"):
+        for n in (f"{hb}.json", f"{hb}.png", f"{hb}.md"):
             print(f"[saved] {analysis_dir / n}")
 
 
