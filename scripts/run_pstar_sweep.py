@@ -1,35 +1,38 @@
 """
-Orchestrate the drift-budget-law (p*) sweep.
+Orchestrate the drift-budget-law (p*) sweep -- ETA-SWEEP edition.
 
-For each (arch, severity) it:
-  1. Runs the source (no-adapt) baseline once -> source accuracy for that
-     severity (used by the soft-collapse criterion).
-  2. Picks a known-stable reference tether p_ref (escalating up a fallback
-     ladder if the default p_ref itself collapses) -> the run used to measure
+The decisive x-axis lever is eta (the HEAT learning rate), NOT severity: at fixed
+arch + severity, ||g_bar|| is ~constant near the source, so sweeping eta moves
+eta*||g_bar|| ~20x and the law predicts p* scales linearly with eta. A "cell" is
+therefore (arch, severity, eta), and each run's filename is eta-tagged.
+
+For each (arch, severity, eta) cell it:
+  1. Runs the source (no-adapt) baseline -> source accuracy (soft-collapse ref).
+  2. Picks a known-stable reference tether p_ref from the eta-SCALED ladder
+     (escalating if the default rung collapses) -> the run used to measure
      ||g_bar|| and the reference drift.
-  3. Runs the coarse p-grid, applies the collapse criterion, brackets the
-     stable/collapse boundary, and BISECTS it twice to localize p* to ~+-0.0025.
+  3. Runs the eta-SCALED coarse p-grid, applies the collapse criterion, brackets
+     the stable/collapse boundary, folds in on-disk rungs, extends upward if all
+     collapse, and BISECTS (default 3x) to localize p*.
 
-Everything routes through scripts/run_tier2.py --protocol p9 (we never
-reimplement the adaptation loop). Every run's JSON is written to RESULTS_DIR
-immediately by run_tier2, so the sweep is fully resumable: a run whose JSON
-already exists is skipped, so re-running after a Colab disconnect continues.
+Everything routes through scripts/run_tier2.py --protocol p9 (--heat-lr = eta;
+we never reimplement the adaptation loop). Every run's JSON is written to
+RESULTS_DIR immediately, so the sweep is fully resumable: a run whose eta-tagged
+JSON already exists is skipped.
 
 We do NOT decide the final p* here -- scripts/analyze_pstar_law.py is the single
-source of truth for the deliverable and recomputes p* from all runs present.
-The sweep only ensures the necessary runs exist and uses the SAME bracketing
-logic (pstar_common.choose_pstar) to decide which bisection midpoints to run.
+source of truth and recomputes p* from all runs present, using each run's own eta.
 
-Usage (cheaper arch first is automatic):
+Usage (Phase A -- WRN only, severity 5, eta sweep):
   python scripts/run_pstar_sweep.py \
       --results-dir /content/drive/MyDrive/pstar_results \
-      --ckpt-resnet18 experiments/checkpoints/resnet18_final.pt \
-      --ckpt-wrn      experiments/checkpoints/wrn28_10_final.pt \
+      --ckpt-wrn experiments/checkpoints/wrn28_10_final.pt \
       --c10c-root data/cifar10c \
-      --archs resnet18 wrn28_10 --severities 1 3 5 \
-      --p-grid 0.0 0.005 0.010 0.020 --bisect-steps 2 --seed 42
+      --archs wrn28_10 --severities 5 \
+      --etas 2e-4 5e-4 1e-3 2e-3 4e-3 \
+      --p-grid 0.0 0.005 0.010 0.020 --bisect-steps 3 --seed 42
 
-  # Pipeline-validation gate (section 6.1 anchor) -- run this before the sweep:
+  # Pipeline-validation gate (WRN sev5 anchor, eta=1e-3) -- run before the sweep:
   python scripts/run_pstar_sweep.py --sanity-check-only \
       --results-dir <dir> --ckpt-wrn <wrn.pt> --c10c-root data/cifar10c
 """
@@ -72,10 +75,16 @@ def parse_args():
     p.add_argument("--severities-wrn28_10", type=int, nargs="+", default=None,
                    help="Per-arch severity override for wrn28_10 (wins over "
                         "--severities and the per-arch default).")
-    p.add_argument("--p-grid", type=float, nargs="+", default=list(pc.DEFAULT_P_GRID))
-    p.add_argument("--bisect-steps", type=int, default=2)
+    p.add_argument("--p-grid", type=float, nargs="+", default=list(pc.DEFAULT_P_GRID),
+                   help="BASE coarse p-grid (at eta=1e-3). Scaled by eta/1e-3 per cell.")
+    p.add_argument("--etas", type=float, nargs="+",
+                   default=[2e-4, 5e-4, 1e-3, 2e-3, 4e-3],
+                   help="Learning rates to sweep (the x-axis lever). Each (arch, "
+                        "severity, eta) is its own p* cell.")
+    p.add_argument("--bisect-steps", type=int, default=3,
+                   help="Bisections of the stable/collapse bracket (default 3 for "
+                        "the eta-sweep, whose predicted p* spread is large).")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--heat-lr", type=float, default=pc.ETA)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--sanity-check-only", action="store_true",
@@ -119,15 +128,17 @@ def _store_point(points, p, data, source_acc, pref_drift):
     return points[p]
 
 
-def ensure_run(args, arch, severity, ckpt, *, p=None, source=False,
+def ensure_run(args, arch, severity, ckpt, *, eta, p=None, source=False,
                log_prefix="") -> dict | None:
-    """Ensure the run JSON for (arch, sev, p|source) exists; run it if not.
+    """Ensure the run JSON for (arch, sev, eta, p|source) exists; run it if not.
 
-    Returns the loaded JSON dict, or None if the run failed (recorded as a
-    run_error sidecar so the whole sweep does not crash).
+    `eta` is the HEAT learning rate for this run (the swept lever); it is passed
+    as --heat-lr AND encoded in the filename tag so runs at different eta never
+    collide. Returns the loaded JSON dict, or None if the run failed (recorded
+    as a run_error sidecar so the whole sweep does not crash).
     """
     out_path = pc.run_output_path(args.results_dir, arch, severity, args.seed,
-                                  p=p, source=source)
+                                  p=p, source=source, eta=eta)
     if out_path.exists():
         try:
             return pc.load_json(out_path)
@@ -140,7 +151,7 @@ def ensure_run(args, arch, severity, ckpt, *, p=None, source=False,
     cmd = pc.build_run_command(
         run_tier2=RUN_TIER2, arch=arch, checkpoint=ckpt, severity=severity,
         seed=args.seed, results_dir=Path(args.results_dir),
-        c10c_root=args.c10c_root, heat_lr=args.heat_lr,
+        c10c_root=args.c10c_root, heat_lr=eta,
         batch_size=args.batch_size, num_workers=args.num_workers,
         p=p, source=source,
     )
@@ -149,22 +160,22 @@ def ensure_run(args, arch, severity, ckpt, *, p=None, source=False,
 
     if not ok or not out_path.exists():
         err_path = pc.run_error_path(args.results_dir, arch, severity, args.seed,
-                                     p=p, source=source)
+                                     p=p, source=source, eta=eta)
         try:
             err_path.write_text(
-                f"run_error for {arch} sev{severity} {label}\n"
+                f"run_error for {arch} sev{severity} lr{pc.format_p(eta)} {label}\n"
                 f"elapsed={elapsed:.1f}s\n\n{tail}",
                 encoding="utf-8",
             )
         except Exception:
             pass
-        print(f"{log_prefix}[run_error] {arch} sev{severity} {label} "
-              f"({elapsed:.1f}s) -> recorded {err_path.name}, continuing.",
+        print(f"{log_prefix}[run_error] {arch} sev{severity} lr{pc.format_p(eta)} "
+              f"{label} ({elapsed:.1f}s) -> recorded {err_path.name}, continuing.",
               flush=True)
         return None
 
-    print(f"{log_prefix}[ok] {arch} sev{severity} {label} ({elapsed:.1f}s) "
-          f"-> {out_path.name}", flush=True)
+    print(f"{log_prefix}[ok] {arch} sev{severity} lr{pc.format_p(eta)} {label} "
+          f"({elapsed:.1f}s) -> {out_path.name}", flush=True)
     try:
         return pc.load_json(out_path)
     except Exception as exc:
@@ -173,19 +184,20 @@ def ensure_run(args, arch, severity, ckpt, *, p=None, source=False,
         return None
 
 
-def select_pref(args, arch, severity, ckpt, source_acc, log_prefix=""):
+def select_pref(args, arch, severity, ckpt, eta, source_acc, log_prefix=""):
     """Find a known-stable reference tether p_ref for ||g_bar|| (section 6.1).
 
-    Stability here uses hard collapse + below-source only (NOT the drift-ratio
-    criterion, which is defined relative to p_ref itself). Returns
-    (p_ref_used, pref_drift, gbar) -- gbar/pref_drift are None if no stable
-    reference could be found.
+    The ladder is SCALED by eta/1e-3 so a stable reference exists even at large
+    eta (where p* is large and p_ref must exceed it). Stability uses hard
+    collapse + below-source only (NOT the drift-ratio criterion, which is
+    defined relative to p_ref itself). Returns (p_ref_used, pref_drift, gbar).
     """
-    candidates = pc.PREF_FALLBACKS.get(arch, [pc.PREF_DEFAULT.get(arch, 0.01)])
+    candidates = pc.scaled_pref_ladder(arch, eta)
     last_data = None
     last_p = None
     for cand in candidates:
-        data = ensure_run(args, arch, severity, ckpt, p=cand, log_prefix=log_prefix)
+        data = ensure_run(args, arch, severity, ckpt, eta=eta, p=cand,
+                          log_prefix=log_prefix)
         if data is None:
             continue
         last_data, last_p = data, cand
@@ -211,39 +223,46 @@ def select_pref(args, arch, severity, ckpt, source_acc, log_prefix=""):
     return None, None, None
 
 
-def sweep_cell(args, arch, severity, ckpt, log_prefix=""):
-    """Run the full p* search for one (arch, severity). Returns a summary dict."""
-    print(f"\n{log_prefix}=== {arch} severity={severity} ===", flush=True)
+def sweep_cell(args, arch, severity, eta, ckpt, log_prefix=""):
+    """Run the full p* search for one (arch, severity, eta). Returns a summary."""
+    print(f"\n{log_prefix}=== {arch} severity={severity} eta={pc.format_p(eta)} "
+          f"===", flush=True)
 
-    # 1. Source baseline.
-    src_data = ensure_run(args, arch, severity, ckpt, source=True, log_prefix=log_prefix)
+    # 1. Source baseline (per eta; eta does not affect source, but it keeps the
+    # cell self-contained and the filename eta-tagged).
+    src_data = ensure_run(args, arch, severity, ckpt, eta=eta, source=True,
+                          log_prefix=log_prefix)
     source_acc = pc.source_mean_acc(src_data) if src_data is not None else None
     print(f"{log_prefix}  source_acc={_fmt(source_acc)}", flush=True)
 
-    # 2. Reference p_ref for ||g_bar||.
-    p_ref, pref_drift, gbar = select_pref(args, arch, severity, ckpt, source_acc,
-                                          log_prefix=log_prefix)
+    # 2. Reference p_ref for ||g_bar|| (eta-scaled ladder).
+    p_ref, pref_drift, gbar = select_pref(args, arch, severity, ckpt, eta,
+                                          source_acc, log_prefix=log_prefix)
 
-    # 3. Coarse grid (p_ref candidates already ran; grid points reuse them).
+    # 3. Coarse grid, SCALED by eta/1e-3 (p_ref candidates already ran; grid
+    # points reuse them). A fixed grid can't bracket p* across a ~20x range.
+    p_grid = pc.scaled_p_grid(eta, base=args.p_grid)
     points: dict[float, dict] = {}
-    for p in sorted(set(args.p_grid)):
-        data = ensure_run(args, arch, severity, ckpt, p=p, log_prefix=log_prefix)
+    for p in sorted(set(p_grid)):
+        data = ensure_run(args, arch, severity, ckpt, eta=eta, p=p,
+                          log_prefix=log_prefix)
         rec = _store_point(points, p, data, source_acc, pref_drift)
         if rec["valid"]:
-            print(f"{log_prefix}  p={pc.format_p(p):>7s} -> "
+            print(f"{log_prefix}  p={pc.format_p(p):>8s} -> "
                   f"{'COLLAPSE' if rec['collapsed'] else 'stable':8s} "
                   f"({rec['criterion']}) mean_acc={_fmt(rec['mean_acc'])} "
                   f"||g_bar||={_fmt(rec['gbar'])}", flush=True)
 
-    # 3b. Fold in EVERY existing run on disk for this cell -- notably the
-    # p_ref-ladder rungs (0.040 / 0.080) that the coarse grid never visits. At
-    # high severity the whole coarse grid collapses, and surfacing those stable
-    # rungs is what gives choose_pstar a real [collapse, stable] bracket. These
-    # runs already exist on disk, so we LOAD only (never re-run).
-    for p in pc.discover_p_values(args.results_dir, arch, severity, args.seed):
+    # 3b. Fold in EVERY existing run on disk for this cell (this eta) -- notably
+    # the eta-scaled p_ref-ladder rungs that the coarse grid never visits. At
+    # high eta the whole coarse grid collapses, and surfacing those stable rungs
+    # is what gives choose_pstar a real [collapse, stable] bracket. These runs
+    # already exist on disk, so we LOAD only (never re-run).
+    for p in pc.discover_p_values(args.results_dir, arch, severity, args.seed, eta):
         if p in points and points[p].get("valid"):
             continue
-        path = pc.run_output_path(args.results_dir, arch, severity, args.seed, p=p)
+        path = pc.run_output_path(args.results_dir, arch, severity, args.seed,
+                                  p=p, eta=eta)
         data = None
         if path.exists():
             try:
@@ -253,32 +272,33 @@ def sweep_cell(args, arch, severity, ckpt, log_prefix=""):
         if data is None:
             continue
         rec = _store_point(points, p, data, source_acc, pref_drift)
-        print(f"{log_prefix}  (disk) p={pc.format_p(p):>7s} -> "
+        print(f"{log_prefix}  (disk) p={pc.format_p(p):>8s} -> "
               f"{'COLLAPSE' if rec['collapsed'] else 'stable':8s} "
               f"({rec.get('criterion')})", flush=True)
 
     # 3c. If even the strongest run on disk collapses (no stable point at all,
-    # so choose_pstar can't bracket), extend the grid UPWARD until one p is
-    # stable -- capped at ~5 new runs. If nothing is stable, p* is legitimately
-    # unresolved for this cell ("law region exhausted") and we say so.
+    # so choose_pstar can't bracket), extend the (eta-scaled) grid UPWARD until
+    # one p is stable -- capped at ~5 new runs. If nothing is stable, p* is
+    # legitimately unresolved for this cell ("law region exhausted").
     sel = pc.choose_pstar(list(points.values()))
     if sel["bracket_high"] is None:
         print(f"{log_prefix}  all tested p collapse; extending grid upward "
               f"(cap 5 runs).", flush=True)
         extra = 0
-        for p in pc.EXTEND_P_GRID:
+        for p in pc.scaled_extend_grid(eta):
             if extra >= 5:
                 break
             if p in points and points[p].get("valid"):
                 if not points[p]["collapsed"]:
                     break  # already have a stable upper anchor
                 continue
-            data = ensure_run(args, arch, severity, ckpt, p=p, log_prefix=log_prefix)
+            data = ensure_run(args, arch, severity, ckpt, eta=eta, p=p,
+                              log_prefix=log_prefix)
             extra += 1
             rec = _store_point(points, p, data, source_acc, pref_drift)
             status = ("run_error" if not rec["valid"]
                       else ("stable" if not rec["collapsed"] else "COLLAPSE"))
-            print(f"{log_prefix}  extend p={pc.format_p(p):>7s} -> {status}",
+            print(f"{log_prefix}  extend p={pc.format_p(p):>8s} -> {status}",
                   flush=True)
             if rec["valid"] and not rec["collapsed"]:
                 break
@@ -297,14 +317,15 @@ def sweep_cell(args, arch, severity, ckpt, log_prefix=""):
         mid = round((lo + hi) / 2.0, 6)
         if mid in points:
             break  # nothing new to learn
-        data = ensure_run(args, arch, severity, ckpt, p=mid, log_prefix=log_prefix)
+        data = ensure_run(args, arch, severity, ckpt, eta=eta, p=mid,
+                          log_prefix=log_prefix)
         if data is None:
             points[mid] = {"p": mid, "collapsed": False, "valid": False}
             break
         v = pc.classify_run(data, source_acc, pref_drift)
         points[mid] = {"p": mid, "collapsed": v["collapsed"], "valid": True,
                        "criterion": v["criterion"]}
-        print(f"{log_prefix}  bisect[{i+1}] p={pc.format_p(mid):>7s} -> "
+        print(f"{log_prefix}  bisect[{i+1}] p={pc.format_p(mid):>8s} -> "
               f"{'COLLAPSE' if v['collapsed'] else 'stable':8s} "
               f"({v['criterion']}) (bracket was [{pc.format_p(lo)},{pc.format_p(hi)}])",
               flush=True)
@@ -313,10 +334,10 @@ def sweep_cell(args, arch, severity, ckpt, log_prefix=""):
     print(f"{log_prefix}  => p*~={_fmt(final['p_star'])} "
           f"bracket=[{_fmt(final['bracket_low'])},{_fmt(final['bracket_high'])}] "
           f"p_ref={pc.format_p(p_ref) if p_ref is not None else 'none'} "
-          f"||g_bar||={_fmt(gbar)} eta*||g_bar||={_fmt((gbar or 0) * args.heat_lr)}",
+          f"||g_bar||={_fmt(gbar)} eta*||g_bar||={_fmt((gbar or 0) * eta)}",
           flush=True)
     return {
-        "arch": arch, "severity": severity, "source_acc": source_acc,
+        "arch": arch, "severity": severity, "eta": eta, "source_acc": source_acc,
         "p_ref": p_ref, "gbar": gbar, "p_star": final["p_star"],
         "bracket": [final["bracket_low"], final["bracket_high"]],
     }
@@ -331,12 +352,13 @@ def run_sanity_check(args) -> int:
     in a sane band). Exact step numbers vary with hardware/seed, so they are
     reported but not asserted to the integer.
     """
-    print("\n=== PIPELINE VALIDATION: WRN-28-10 severity 5 ===", flush=True)
+    print("\n=== PIPELINE VALIDATION: WRN-28-10 severity 5 (eta=1e-3) ===", flush=True)
     ckpt = _ckpt_for("wrn28_10", args)
     sev = 5
+    eta = pc.ETA  # the anchor was measured at the default lr=1e-3
     results = {}
     for p in (0.0, 0.005, 0.010):
-        data = ensure_run(args, "wrn28_10", sev, ckpt, p=p, log_prefix="  ")
+        data = ensure_run(args, "wrn28_10", sev, ckpt, eta=eta, p=p, log_prefix="  ")
         if data is None:
             print(f"  [FAIL] run p={pc.format_p(p)} did not complete.", flush=True)
             return 2
@@ -395,29 +417,37 @@ def main():
         sys.exit(run_sanity_check(args))
 
     sev_map = {arch: _severities_for(arch, args) for arch in args.archs}
+    etas = sorted(set(args.etas))
     print(f"[sweep] results_dir={args.results_dir}", flush=True)
     print(f"[sweep] archs={args.archs} severities(by arch)={sev_map} "
-          f"p_grid={[pc.format_p(p) for p in args.p_grid]} "
+          f"etas={[pc.format_p(e) for e in etas]} "
+          f"base_p_grid={[pc.format_p(p) for p in args.p_grid]} "
           f"bisect_steps={args.bisect_steps} seed={args.seed}", flush=True)
-    n_cells = sum(len(v) for v in sev_map.values())
-    print(f"[sweep] {n_cells} (arch,severity) cells. resnet18 processed first.",
-          flush=True)
+    n_cells = sum(len(v) for v in sev_map.values()) * len(etas)
+    print(f"[sweep] {n_cells} (arch,severity,eta) cells. resnet18 first; "
+          f"within an arch, severity then eta in configured order.", flush=True)
 
-    # resnet18 (cheaper) first; severities in configured order.
+    # resnet18 (cheaper) first; then severity, then eta -- so partial progress
+    # (an early eta's p* point) is useful even if cut off.
     arch_order = sorted(args.archs, key=lambda a: 0 if a == "resnet18" else 1)
     t_start = time.time()
     summaries = []
     for arch in arch_order:
         ckpt = _ckpt_for(arch, args)
         for sev in sev_map[arch]:
-            summaries.append(sweep_cell(args, arch, sev, ckpt, log_prefix=""))
+            for eta in etas:
+                summaries.append(sweep_cell(args, arch, sev, eta, ckpt, log_prefix=""))
 
     print(f"\n[sweep] done in {time.time() - t_start:.1f}s. "
           f"Run scripts/analyze_pstar_law.py for the verdict.", flush=True)
     print("[sweep] cell summary:", flush=True)
     for s in summaries:
-        print(f"  {s['arch']:10s} sev{s['severity']}  p*~={_fmt(s['p_star'])}  "
-              f"||g_bar||={_fmt(s['gbar'])}  p_ref={pc.format_p(s['p_ref']) if s['p_ref'] is not None else 'none'}",
+        eta = s.get("eta", pc.ETA)
+        exg = (s["gbar"] * eta) if s["gbar"] is not None else None
+        print(f"  {s['arch']:10s} sev{s['severity']} lr{pc.format_p(eta):>7s}  "
+              f"p*~={_fmt(s['p_star'])}  ||g_bar||={_fmt(s['gbar'])}  "
+              f"eta*||g_bar||={_fmt(exg)}  "
+              f"p_ref={pc.format_p(s['p_ref']) if s['p_ref'] is not None else 'none'}",
               flush=True)
 
 

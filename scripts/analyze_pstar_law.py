@@ -2,10 +2,12 @@
 Analyze the drift-budget-law (p*) sweep and emit the decisive deliverable.
 
 Reads all run JSONs in RESULTS_DIR (written by run_pstar_sweep.py via
-run_tier2.py), then for each (arch, severity):
+run_tier2.py), then for each (arch, severity, eta) cell:
   * measures ||g_bar|| from the known-stable reference run (section 6.1),
   * derives p* and its bracket from the collapse criterion (sections 6.2-6.3),
-and fits a per-architecture least-squares line of p* vs (eta * ||g_bar||).
+  * uses the run's OWN eta (pc.heat_lr_of) for the x-axis, not a constant,
+and fits a per-architecture least-squares line of p* vs (eta * ||g_bar||),
+pooling all eta-cells of that arch -- the eta-sweep test of the law.
 
 Outputs (exactly the three artifacts in section 7):
   <RESULTS_DIR>/analysis/pstar_law.json   -- machine-readable table
@@ -14,12 +16,13 @@ Outputs (exactly the three artifacts in section 7):
 
 Also prints a Markdown table and the verdict to stdout (the notebook displays
 both inline). This script is the SINGLE SOURCE OF TRUTH for the verdict; it
-recomputes p* from every run present and never silently drops a severity.
+recomputes p* from every run present and never silently drops a cell. It also
+flags any p* whose collapsing edge was a SOFT criterion as a possible confound.
 
 Usage:
   python scripts/analyze_pstar_law.py \
       --results-dir /content/drive/MyDrive/pstar_results \
-      --archs resnet18 wrn28_10 --severities 1 3 5 --seed 42
+      --archs wrn28_10 --severities 5 --etas 2e-4 5e-4 1e-3 2e-3 4e-3 --seed 42
 """
 
 from __future__ import annotations
@@ -27,7 +30,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 import sys
 from pathlib import Path
 
@@ -51,28 +53,15 @@ def parse_args():
     p.add_argument("--archs", type=str, nargs="+", default=list(pc.DEFAULT_ARCHS),
                    choices=["resnet18", "wrn28_10"])
     p.add_argument("--severities", type=int, nargs="+", default=list(pc.DEFAULT_SEVERITIES))
+    p.add_argument("--etas", type=float, nargs="+", default=None,
+                   help="Learning rates to include. Default: auto-discover every "
+                        "eta with runs on disk for each (arch, severity).")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
 
-def discover_p_values(results_dir: Path, arch: str, severity: int, seed: int) -> list[float]:
-    """Find every restore-prob whose run JSON exists for (arch, severity)."""
-    prefix = f"p9_{arch}_pstar_p"
-    suffix = f"_seed{seed}_sev{severity}.json"
-    pat = re.compile(re.escape(prefix) + r"(.+?)" + re.escape(suffix) + r"$")
-    ps: list[float] = []
-    for path in Path(results_dir).glob(f"{prefix}*{suffix}"):
-        m = pat.match(path.name)
-        if m:
-            try:
-                ps.append(float(m.group(1)))
-            except ValueError:
-                continue
-    return sorted(set(ps))
-
-
-def load_p_run(results_dir, arch, severity, seed, p):
-    path = pc.run_output_path(results_dir, arch, severity, seed, p=p)
+def load_p_run(results_dir, arch, severity, seed, p, eta):
+    path = pc.run_output_path(results_dir, arch, severity, seed, p=p, eta=eta)
     if not path.exists():
         return None
     try:
@@ -81,15 +70,16 @@ def load_p_run(results_dir, arch, severity, seed, p):
         return None
 
 
-def derive_pref(results_dir, arch, severity, seed, source_acc):
+def derive_pref(results_dir, arch, severity, seed, eta, source_acc):
     """Read-only re-derivation of the reference p_ref (mirrors the sweep).
 
-    Stability uses hard collapse + below-source only (the drift-ratio test is
-    defined relative to p_ref). Returns (p_ref, pref_drift, gbar)."""
-    candidates = pc.PREF_FALLBACKS.get(arch, [pc.PREF_DEFAULT.get(arch, 0.01)])
+    Uses the eta-SCALED ladder and eta-tagged paths. Stability uses hard
+    collapse + below-source only (the drift-ratio test is defined relative to
+    p_ref). Returns (p_ref, pref_drift, gbar)."""
+    candidates = pc.scaled_pref_ladder(arch, eta)
     last = (None, None, None)
     for cand in candidates:
-        data = load_p_run(results_dir, arch, severity, seed, cand)
+        data = load_p_run(results_dir, arch, severity, seed, cand, eta)
         if data is None:
             continue
         gbar_res = pc.grad_norm_gbar(data)
@@ -103,9 +93,10 @@ def derive_pref(results_dir, arch, severity, seed, source_acc):
     return last  # no stable reference found; best effort
 
 
-def analyze_cell(results_dir, arch, severity, seed):
-    """Build the full row for one (arch, severity)."""
-    src_path = pc.run_output_path(results_dir, arch, severity, seed, source=True)
+def analyze_cell(results_dir, arch, severity, eta, seed):
+    """Build the full row for one (arch, severity, eta) cell."""
+    src_path = pc.run_output_path(results_dir, arch, severity, seed,
+                                  source=True, eta=eta)
     source_acc = None
     if src_path.exists():
         try:
@@ -113,17 +104,22 @@ def analyze_cell(results_dir, arch, severity, seed):
         except Exception:
             source_acc = None
 
-    p_ref, pref_drift, gbar = derive_pref(results_dir, arch, severity, seed, source_acc)
+    p_ref, pref_drift, gbar = derive_pref(results_dir, arch, severity, seed,
+                                          eta, source_acc)
 
-    p_values = discover_p_values(results_dir, arch, severity, seed)
+    p_values = pc.discover_p_values(results_dir, arch, severity, seed, eta)
     points = []
     criteria: dict[float, str] = {}
     mean_accs: dict[float, float] = {}
+    eta_used = None
     for p in p_values:
-        data = load_p_run(results_dir, arch, severity, seed, p)
+        data = load_p_run(results_dir, arch, severity, seed, p, eta)
         if data is None:
             points.append({"p": p, "collapsed": False, "valid": False})
             continue
+        # x-axis uses the run's OWN eta (CHANGE A), not the hardcoded pc.ETA.
+        if eta_used is None:
+            eta_used = pc.heat_lr_of(data)
         v = pc.classify_run(data, source_acc, pref_drift)
         points.append({"p": p, "collapsed": v["collapsed"], "valid": True})
         criteria[p] = v["criterion"]
@@ -147,8 +143,9 @@ def analyze_cell(results_dir, arch, severity, seed):
 
     stable_mean_acc = mean_accs.get(bhi) if bhi is not None else None
 
-    eta = pc.ETA
-    eta_gbar = (gbar * eta) if gbar is not None else None
+    if eta_used is None:
+        eta_used = eta  # no valid run loaded; fall back to the intended eta
+    eta_gbar = (gbar * eta_used) if gbar is not None else None
 
     return {
         "arch": arch,
@@ -156,7 +153,7 @@ def analyze_cell(results_dir, arch, severity, seed):
         "source_acc": source_acc,
         "p_ref_used": p_ref,
         "grad_norm_gbar": gbar,
-        "eta": eta,
+        "eta": eta_used,
         "eta_times_gbar": eta_gbar,
         "p_star": p_star,
         "p_star_bracket_low": blo,
@@ -179,10 +176,13 @@ def fit_arch(rows: list[dict]):
     return fit, xs, ys, usable
 
 
-def severity_monotone(rows: list[dict], key: str) -> bool:
-    seq = [(r["severity"], r[key]) for r in rows if r.get(key) is not None]
+def monotone_in_x(rows: list[dict]) -> bool:
+    """Is p* non-decreasing as eta*||g_bar|| (the x-axis) increases? This is the
+    meaningful monotonicity for the eta-sweep (eta is the lever, not severity)."""
+    seq = [(r["eta_times_gbar"], r["p_star"]) for r in rows
+           if r.get("eta_times_gbar") is not None and r.get("p_star") is not None]
     seq.sort()
-    vals = [v for _s, v in seq]
+    vals = [y for _x, y in seq]
     return all(b >= a - 1e-9 for a, b in zip(vals, vals[1:]))
 
 
@@ -192,11 +192,11 @@ def make_plot(per_arch_fit: dict, out_png: Path):
     for arch, info in per_arch_fit.items():
         fit, xs, ys, usable = info["fit"], info["xs"], info["ys"], info["rows"]
         c = colors.get(arch, None)
-        sevs = [r["severity"] for r in usable]
+        etas = [r["eta"] for r in usable]
         ax.scatter(xs, ys, color=c, s=70, zorder=3,
-                   label=f"{arch} (severities {sevs})")
-        for x, y, s in zip(xs, ys, sevs):
-            ax.annotate(f"s{s}", (x, y), textcoords="offset points",
+                   label=f"{arch} (etas {[f'{e:g}' for e in sorted(set(etas))]})")
+        for x, y, e in zip(xs, ys, etas):
+            ax.annotate(f"η={e:g}", (x, y), textcoords="offset points",
                         xytext=(6, 4), fontsize=8, color=c)
 
         # Censored cells: p* unresolved ("law region exhausted" -- every tested
@@ -213,7 +213,7 @@ def make_plot(per_arch_fit: dict, out_png: Path):
                        edgecolors=c, linewidths=1.6, zorder=3,
                        label=f"{arch} censored (p* > bound, excl. from fit)")
             for x, y, r in zip(cx, cy, censored):
-                ax.annotate(f"s{r['severity']}↑", (x, y), textcoords="offset points",
+                ax.annotate(f"η={r['eta']:g}↑", (x, y), textcoords="offset points",
                             xytext=(6, 4), fontsize=8, color=c)
         if fit is not None:
             xmin, xmax = 0.0, max(xs) * 1.1 if xs else 1.0
@@ -226,9 +226,9 @@ def make_plot(per_arch_fit: dict, out_png: Path):
             ax.plot(xx, yy, color=c, linestyle="--", linewidth=1.6, zorder=2,
                     label=(f"  fit: slope={slope:.3g} (R={R:.3g}), "
                            f"b={fit['intercept']:.3g}, R²={r2s}"))
-    ax.set_xlabel(r"$\eta \cdot \|\bar{g}\|$   ($\eta=10^{-3}$)")
+    ax.set_xlabel(r"$\eta \cdot \|\bar{g}\|$   (swept via $\eta$, the lever)")
     ax.set_ylabel(r"$p^*$  (minimum tether to avoid collapse)")
-    ax.set_title("Drift-budget law:  $p^* \\approx (\\eta\\,\\|\\bar g\\|)/R$")
+    ax.set_title("Drift-budget law (eta-sweep):  $p^* \\approx (\\eta\\,\\|\\bar g\\|)/R$")
     ax.axhline(0, color="0.8", linewidth=0.8, zorder=0)
     ax.axvline(0, color="0.8", linewidth=0.8, zorder=0)
     ax.legend(fontsize=8, loc="best")
@@ -259,37 +259,44 @@ def build_verdict(per_arch_fit: dict, all_rows: list[dict]) -> tuple[str, str]:
         yspan = (max(ys) - min(ys)) if len(ys) > 1 else max(ys)
         ref = max(yspan, max(ys), 1e-9)
         intercept_small = abs(fit["intercept"]) <= INTERCEPT_FRAC * ref
-        mono_g = severity_monotone(rows, "grad_norm_gbar")
-        mono_p = severity_monotone(rows, "p_star")
+        mono_p = monotone_in_x(rows)
         linear = (not math.isnan(r2)) and r2 >= R2_GOOD
         good = linear and intercept_small
+        # CHANGE E: flag p* points whose collapsing edge was a SOFT criterion
+        # (soft:below_source / soft:drift_blowup) -- a possible confound. For
+        # WRN sev5 the boundary should normally be hard:nan_inf.
+        soft_rows = [r for r in rows
+                     if str(r.get("collapse_criterion", "")).startswith("soft:")]
         arch_status[arch] = {"good": good, "linear": linear,
                              "intercept_small": intercept_small,
-                             "mono_g": mono_g, "mono_p": mono_p,
+                             "mono_p": mono_p, "soft_rows": soft_rows,
                              "R": R, "r2": r2, "fit": fit}
         lines.append(
             f"- **{arch}**: slope={slope:.4g} (=> R={R:.4g}), "
             f"intercept={fit['intercept']:.4g} "
             f"({'small' if intercept_small else 'NON-trivial'} vs y-range {ref:.4g}), "
             f"R²={r2:.3f}. "
-            f"||g_bar|| {'monotone' if mono_g else 'NON-monotone'} in severity; "
-            f"p* {'monotone' if mono_p else 'NON-monotone'} in severity."
+            f"p* {'monotone' if mono_p else 'NON-monotone'} in eta*||g_bar||."
         )
+        if soft_rows:
+            tags = ", ".join(f"eta={r['eta']:g}:{r['collapse_criterion']}"
+                             for r in soft_rows)
+            lines.append(
+                f"    ⚠ soft-criterion boundary at [{tags}] — possible confound; "
+                f"a clean signal should be hard:nan_inf (esp. WRN sev5)."
+            )
 
-    fitted = [a for a, s in arch_status.items() if s.get("fit") is not None and s.get("linear") is not None]
     n_good = sum(1 for s in arch_status.values() if s.get("good"))
     n_linear = sum(1 for s in arch_status.values() if s.get("linear"))
     n_arch = len(arch_status)
-    any_nonmono = any(
-        (s.get("mono_p") is False or s.get("mono_g") is False)
-        for s in arch_status.values()
-    )
+    any_nonmono = any(s.get("mono_p") is False for s in arch_status.values())
 
     if n_arch >= 1 and n_good == n_arch:
         verdict = "LAW SUPPORTED"
         why = (f"All {n_arch} architecture(s) are linear (R²>={R2_GOOD}) with a "
-               f"small intercept. p* tracks eta*||g_bar|| as predicted; each arch "
-               f"has its own slope 1/R, consistent with R being per-architecture.")
+               f"small intercept. p* tracks eta*||g_bar|| as predicted across the "
+               f"eta sweep; each arch has its own slope 1/R, consistent with R "
+               f"being per-architecture.")
     elif n_linear >= 1:
         verdict = "LAW PARTIAL"
         bad = [a for a, s in arch_status.items() if not s.get("good")]
@@ -305,27 +312,28 @@ def build_verdict(per_arch_fit: dict, all_rows: list[dict]) -> tuple[str, str]:
                 causes.append(f"{a}: low R² ({s.get('r2'):.3f})")
             elif not s.get("intercept_small"):
                 causes.append(f"{a}: non-trivial intercept")
-            if s.get("mono_g") is False:
-                causes.append(f"{a}: ||g_bar|| not monotone in severity")
             if s.get("mono_p") is False:
-                causes.append(f"{a}: p* not monotone in severity")
+                causes.append(f"{a}: p* not monotone in eta*||g_bar||")
+            if s.get("soft_rows"):
+                causes.append(f"{a}: soft-criterion boundary on "
+                              f"{len(s['soft_rows'])} point(s) (possible confound)")
         if causes:
             why += "Likely cause(s): " + "; ".join(causes) + "."
     else:
         verdict = "LAW NOT SUPPORTED"
         why = ("No architecture shows a clean line through the origin. ")
         if any_nonmono:
-            why += ("Most likely cause: ||g_bar|| and/or p* are not monotone in "
-                    "severity, so the shift-magnitude axis does not order the "
-                    "points. ")
+            why += ("Most likely cause: p* is not monotone in eta*||g_bar||, so "
+                    "the predicted scaling does not hold. ")
         else:
             why += "Points scatter; p* does not track eta*||g_bar|| linearly. "
 
     md = []
-    md.append(f"# Drift-budget law verdict: {verdict}\n")
+    md.append(f"# Drift-budget law verdict (eta-sweep): {verdict}\n")
     md.append("Prediction: p* ~= (eta * ||g_bar||) / R, with R a per-architecture "
-              "constant. With architecture fixed and severity varied, p* vs "
-              "eta*||g_bar|| should be a straight line through the origin "
+              "constant. At fixed arch + severity, ||g_bar|| is ~constant near the "
+              "source, so sweeping eta moves the x-axis ~linearly and p* should "
+              "scale linearly with eta -- a straight line through the origin "
               "(slope 1/R).\n")
     md.extend(lines)
     md.append("")
@@ -334,8 +342,8 @@ def build_verdict(per_arch_fit: dict, all_rows: list[dict]) -> tuple[str, str]:
 
 
 def print_table(rows: list[dict]):
-    cols = ["arch", "severity", "source_acc", "p_ref_used", "grad_norm_gbar",
-            "eta", "eta_times_gbar", "p_star", "p_star_bracket_low",
+    cols = ["arch", "severity", "eta", "source_acc", "p_ref_used", "grad_norm_gbar",
+            "eta_times_gbar", "p_star", "p_star_bracket_low",
             "p_star_bracket_high", "collapse_criterion", "stable_mean_acc"]
 
     def fmt(v):
@@ -362,8 +370,13 @@ def main():
     all_rows = []
     for arch in args.archs:
         for sev in args.severities:
-            row = analyze_cell(results_dir, arch, sev, args.seed)
-            all_rows.append(row)
+            # Each (arch, severity, eta) is its own p* cell. Use the explicit
+            # --etas if given, else auto-discover every eta with runs on disk.
+            etas = args.etas if args.etas else pc.discover_etas(
+                results_dir, arch, sev, args.seed)
+            for eta in sorted(set(etas)):
+                row = analyze_cell(results_dir, arch, sev, eta, args.seed)
+                all_rows.append(row)
 
     # Per-arch fits.
     per_arch_fit = {}
@@ -378,7 +391,7 @@ def main():
 
     # Write artifacts.
     law_json = {
-        "eta": pc.ETA,
+        "etas": sorted({r["eta"] for r in all_rows if r.get("eta") is not None}),
         "r2_good_threshold": R2_GOOD,
         "rows": all_rows,
         "fits": {

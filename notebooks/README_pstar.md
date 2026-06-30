@@ -1,18 +1,28 @@
-# p\* drift-budget-law experiment — Colab runbook
+# p\* drift-budget-law experiment — Colab runbook (Phase A: eta-sweep)
 
 **Goal (one plot).** Test the closed-form prediction
 
 > **p\* ≈ (η · ‖ḡ‖) / R**, with **R** a per-architecture constant.
 
-Hold the architecture fixed, vary CIFAR-10-C **severity** (1→5) as the shift-magnitude
-axis. If the law holds, **p\* vs (η·‖ḡ‖)** is a straight line through the origin
-(slope = 1/R) — one independent line per architecture (`resnet18`, `wrn28_10`).
+**Why we sweep η, not severity.** The earlier severity sweep was inconclusive: across
+CIFAR-10-C severity 1→5, ‖ḡ‖ moves only ~14% (WRN) / ~21% (ResNet), so the predicted p\*
+movement is **sub-grid and unobservable**. So we pull a stronger lever on the x-axis: at
+fixed arch + severity, ‖ḡ‖ is ~constant near the source, so sweeping **η** moves
+η·‖ḡ‖ ~20× and the law predicts **p\* scales linearly with η** — a straight line through
+the origin, slope 1/R. That single plot is the decisive go/no-go.
+
+- **Phase A (default):** `wrn28_10`, **severity 5 fixed**, `ETAS = {2e-4, 5e-4, 1e-3,
+  2e-3, 4e-3}`. Predicted p\* spread ~0.0019 → ~0.038 (a ~20× range, far above grid
+  resolution — that is why this works where severity did not).
+- **Phase B (later, only if WRN is clean):** add `resnet18` at sev5 over the same η grid
+  for a second, independent R.
 
 - **p** = `restore_prob`, the Bernoulli source-restore "tether" in HEAT.
 - **p\*** = the minimum p at which the continual run does *not* collapse.
 - **‖ḡ‖** = online stationary gradient norm of the adaptation loss (`grad_l2`), measured
-  from a known-stable reference run.
-- **η** = HEAT learning rate, fixed at `1e-3`.
+  from a known-stable reference run (per cell).
+- **η** = HEAT learning rate — now the **swept lever** (`--heat-lr` per run), not fixed.
+  A "cell" is `(arch, severity, η)`; its filename is η-tagged so etas never collide.
 
 You write nothing — open `notebooks/pstar_colab.ipynb` in Colab and run top-to-bottom.
 
@@ -28,12 +38,13 @@ touch:
 | `REPO_URL` | Git URL to clone | `https://github.com/octadion/heat.git`. If your fork/branch differs, change it (and set `GIT_BRANCH`). Or upload the repo manually and set `REPO_DIR`. |
 | `USE_DRIVE` | Mount Drive so results survive a disconnect | `True` (**strongly recommended** — the sweep takes hours). |
 | `DRIVE_RESULTS_DIR` | Where run JSONs + analysis land | `/content/drive/MyDrive/pstar_results`. Pick any Drive path. |
-| `CKPT_RESNET18`, `CKPT_WRN` | Source checkpoints | See **Checkpoints** below. Leave `""` + `TRAIN_IF_MISSING=True` to train. |
+| `CKPT_DIR`, `CKPT_RESNET18`, `CKPT_WRN` | Source checkpoints | Default to `MyDrive/heat/experiments/checkpoints/<arch>_final.pt`. If yours live elsewhere, edit `CKPT_DIR`. See **Checkpoints** below; leave the paths `""` + `TRAIN_IF_MISSING=True` to train instead. |
 | `TRAIN_IF_MISSING` | Train source models if no checkpoint given | `False`. Set `True` only if you have no checkpoints (WRN training ≈ 4× ResNet). |
-| `ARCHS` | Architectures (= number of lines) | `["resnet18", "wrn28_10"]`. |
-| `SEVERITIES` | Shift-magnitude axis points, **per architecture** | `{"resnet18": [1,3,5], "wrn28_10": [1,2,3,4,5]}` — WRN is the decisive line so it gets full density; ResNet uses the cheaper set. Set it to a plain list (e.g. `[1,3,5]`) to apply the same severities to every arch. |
-| `P_GRID` | Coarse tether grid | `[0.0, 0.005, 0.010, 0.020]`. |
-| `BISECT_STEPS` | Bisections of the stable/collapse bracket | `2` ⇒ p\* resolved to ≈ ±0.0025. |
+| `ARCHS` | Architectures (= number of lines) | Phase A: `["wrn28_10"]`. Phase B: add `"resnet18"`. |
+| `SEVERITIES` | Shift severity (now held fixed) | `[5]`. A plain list applies to all archs; a per-arch dict `{arch: [...]}` also works. |
+| `ETAS` | **The swept lever** (x-axis = η·‖ḡ‖) | `[2e-4, 5e-4, 1e-3, 2e-3, 4e-3]` — one p\* cell per η, spanning a ~20× x-range. |
+| `P_GRID` | **Base** coarse tether grid (at η=1e-3) | `[0.0, 0.005, 0.010, 0.020]`. Auto-scaled by η/1e-3 per cell (a fixed grid can't bracket p\* across 20×). |
+| `BISECT_STEPS` | Bisections of the stable/collapse bracket | `3` (default for the eta-sweep; its predicted spread is large). |
 | `SEED` | Seed | `42`. |
 
 `GPU` choice: **Runtime → Change runtime type → GPU**. L4 or A100 recommended.
@@ -78,47 +89,48 @@ runs are part of the real sweep, so they are *reused*, not wasted.
 
 - Every run's JSON is written to `RESULTS_DIR` (Drive-backed) **immediately** by
   `run_tier2.py`.
-- The sweep **skips any (arch, severity, p) whose JSON already exists** — re-run cell 8
+- The sweep **skips any (arch, severity, η, p) whose JSON already exists** — re-run cell 8
   after a disconnect and it continues.
-- `resnet18` (cheaper) is processed first; severities in configured order, so partial
-  progress is still useful.
+- Order is arch → severity → η, so an early η's p\* point is useful even if cut off.
 - A single run that errors (e.g. OOM) is recorded as a `*.run_error.txt` sidecar and the
   sweep **continues**; re-running retries it.
 
 ---
 
-## Expected wall-clock (default: 8 cells = ResNet ×3 + WRN ×5)
+## Expected wall-clock (Phase A: WRN sev5 × 5 η = 5 cells)
 
-One continual run = the full 15-corruption stream ≈ 2,355 steps. Per (arch, severity) the
-sweep does ≈ **5–7 runs**: 1 source + the coarse grid (overlapping the p_ref ladder) + up
-to `BISECT_STEPS` bisections; high-severity WRN cells may add a few upward-extension runs
-when the whole coarse grid collapses.
+One continual run = the full 15-corruption stream ≈ 2,355 steps. Each η-cell does ≈ **5–7
+runs**: 1 source + the (η-scaled) coarse grid overlapping the p_ref ladder + up to
+`BISECT_STEPS` (=3) bisections; large-η cells may add a few upward-extension runs.
 
-| GPU | ResNet-18 run | WRN-28-10 run | Default sweep (ResNet [1,3,5] + WRN [1,2,3,4,5]) |
-|---|---|---|---|
-| A100 | ~3–5 min | ~8–12 min | ~3.5–5 h |
-| L4 | ~6–9 min | ~15–22 min | ~7–9 h |
-| T4 | ~10–15 min | ~25–40 min | slow — prefer L4/A100 |
+| GPU | WRN-28-10 run | Phase A (5 η cells, WRN sev5) |
+|---|---|---|
+| A100 | ~8–12 min | ~3.5–5 h |
+| L4 | ~15–22 min | ~5–7 h |
+| T4 | ~25–40 min | slow — prefer L4/A100 |
 
-WRN dominates (it is both slower per run and gets all 5 severities). For a quicker first
-pass, set `SEVERITIES = [1, 3, 5]` (≈ 6 cells, ~5–7 h on L4). Training a source model from
-scratch (if `TRAIN_IF_MISSING`) adds ~20–40 min (ResNet) / ~1.5–3 h (WRN) at 30 epochs —
-do this once and save the checkpoint to Drive.
+Phase B (adding `resnet18` over the same η grid) roughly adds another ~2–3 h on L4 (ResNet
+runs are ~2–3× faster than WRN). Training a source model from scratch (if
+`TRAIN_IF_MISSING`) adds ~20–40 min (ResNet) / ~1.5–3 h (WRN) at 30 epochs — do this once
+and save the checkpoint to Drive.
 
 ---
 
 ## Outputs (in `RESULTS_DIR/analysis/`)
 
-- **`pstar_law.json`** — table: `arch, severity, source_acc, p_ref_used, grad_norm_gbar,
-  eta, eta_times_gbar, p_star, p_star_bracket_low/high, collapse_criterion,
+- **`pstar_law.json`** — table: `arch, severity, eta, source_acc, p_ref_used,
+  grad_norm_gbar, eta_times_gbar, p_star, p_star_bracket_low/high, collapse_criterion,
   stable_mean_acc` + per-arch fits + verdict.
-- **`pstar_law.png`** — the deliverable plot: x = η·‖ḡ‖, y = p\*, one series per arch,
-  least-squares fit overlaid with slope (=1/R), intercept, R².
+- **`pstar_law.png`** — the deliverable plot: x = η·‖ḡ‖ (swept via η), y = p\*, one series
+  per arch (points = etas), least-squares fit overlaid with slope (=1/R), intercept, R².
 - **`pstar_verdict.md`** — numeric verdict, one of:
-  - **LAW SUPPORTED** — both archs R² ≥ ~0.9 and small intercept vs y-range.
-  - **LAW PARTIAL** — linear within an arch but intercept non-trivial / one arch clean
-    and one not (names the cause).
-  - **LAW NOT SUPPORTED** — points scatter or p\*/‖ḡ‖ non-monotone in severity.
+  - **LAW SUPPORTED** — every arch R² ≥ ~0.9 and small intercept vs y-range.
+  - **LAW PARTIAL** — linear within an arch but intercept non-trivial / a soft-criterion
+    boundary confound / one arch clean and one not (names the cause).
+  - **LAW NOT SUPPORTED** — points scatter or p\* non-monotone in η·‖ḡ‖.
+- Any p\* point whose collapsing edge was a **soft** criterion (`soft:below_source` /
+  `soft:drift_blowup`) is flagged in the verdict as a possible confound; for WRN sev5 the
+  boundary should normally be `hard:nan_inf`.
 
 The plot and verdict also display inline at the bottom of the notebook.
 
@@ -126,25 +138,29 @@ The plot and verdict also display inline at the bottom of the notebook.
 
 ## How p\* and ‖ḡ‖ are computed (so the result is auditable)
 
+- **The cell** is `(arch, severity, η)`. ‖ḡ‖, p_ref, the p-grid, and p\* are all computed
+  **per cell**, and the x-axis uses the run's **own η** (`pc.heat_lr_of`), not a hardcoded
+  constant.
 - **‖ḡ‖** (`scripts/pstar_common.grad_norm_gbar`): mean of `grad_l2` over local steps
   **50–150** within each corruption block, averaged across all 15 blocks; blocks with any
-  NaN/inf are excluded. Measured from a **stable reference run** `p_ref` (0.005 ResNet /
-  0.010 WRN, escalated up a fallback ladder if that itself collapses at high severity —
-  the ladder rung used is reported as `p_ref_used`).
-- **Collapse criterion** (`classify_run`, section 6.2, priority order): **hard** = any
-  NaN/inf in `grad_l2`/`energy`/`drift_l2`, or stream `mean_accuracy ≤ 0.12`; **soft** =
-  `last_accuracy` < source (no-adapt) accuracy, or stationary `drift_l2` > 5× its value
-  at `p_ref`.
-- **p\*** (`choose_pstar`, section 6.3): the midpoint of the final
-  `[p_collapse, p_stable]` bracket after bisection. ResNet at low severity legitimately
-  gives **p\*≈0** (no collapse even at p=0) — a real point consistent with the law, not
-  discarded. At high severity, where the whole coarse grid collapses, the sweep folds in
-  the stronger p_ref-ladder rungs already on disk and, if even those collapse, **extends
-  the grid upward** (0.03→0.12, capped at ~5 runs) until a stable p is found, so the
-  high-‖ḡ‖ points — which carry the slope — still get a real bracket to bisect. If no
-  tested tether is stable, that cell's p\* is left **unresolved** ("law region
-  exhausted") and the plot shows it as a **censored up-arrow** lower bound (excluded from
-  the fit), never hidden.
+  NaN/inf are excluded. Measured from a **stable reference run** `p_ref`, whose ladder is
+  **scaled by η/1e-3** (so a stable reference exists even at η=4e-3 where p\* ~= 0.038 and
+  p_ref must exceed it); the rung used is reported as `p_ref_used`.
+- **Collapse criterion** (`classify_run`, unchanged): **hard** = any NaN/inf in
+  `grad_l2`/`energy`/`drift_l2`, or stream `mean_accuracy ≤ 0.12`; **soft** =
+  `last_accuracy` < source (no-adapt) accuracy, or stationary `drift_l2` > 5× its value at
+  `p_ref`. The verdict flags any p\* whose collapsing edge was a **soft** criterion as a
+  possible confound (WRN sev5 should be `hard:nan_inf`).
+- **p-grid scaling** (critical): the coarse grid, p_ref ladder, and upward-extension grid
+  are all **scaled by η/1e-3**, because p\* spans ~20× across the η sweep and a fixed grid
+  could not bracket it.
+- **p\*** (`choose_pstar`, unchanged): the midpoint of the final `[p_collapse, p_stable]`
+  bracket after bisection. A cell with no collapse even at p=0 gives **p\*≈0** (a real
+  point). Where the whole coarse grid collapses, the sweep folds in the stronger
+  (η-scaled) p_ref-ladder rungs already on disk and, if even those collapse, **extends the
+  grid upward** (capped at ~5 runs) until a stable p is found. If none is stable, p\* is
+  left **unresolved** ("law region exhausted") and the plot shows it as a **censored
+  up-arrow** lower bound (excluded from the fit), never hidden.
 
 **No p-hacking:** all points are reported and the fit spans all of them. The analysis
 script is the single source of truth and recomputes p\* from every run on disk.
@@ -160,4 +176,5 @@ script is the single source of truth and recomputes p\* from every run on disk.
 | `FileNotFoundError ... .npy` | CIFAR-10-C not fully downloaded. Re-run cell 5. |
 | Sweep restarts from scratch after disconnect | `RESULTS_DIR` not on Drive (`USE_DRIVE=False`) — results were on ephemeral local disk. Set `USE_DRIVE=True`. |
 | OOM on WRN | Lower `BATCH_SIZE` (e.g. 32) in the config cell; the run is recorded as `run_error` and retried on re-run. |
-| Verdict says NOT SUPPORTED / PARTIAL | That may be the honest answer. Read `pstar_verdict.md` — it names the observed cause (e.g. ‖ḡ‖ not monotone, soft-collapse dominating). Densifying `SEVERITIES` to `[1,2,3,4,5]` adds points. |
+| Verdict says NOT SUPPORTED / PARTIAL | That may be the honest answer. Read `pstar_verdict.md` — it names the observed cause (e.g. p\* not monotone in η·‖ḡ‖, or a soft-criterion boundary confound). Adding more η values densifies the line. |
+| Regression check: η=1e-3 WRN sev5 ≠ p\* ~0.0094 | The η plumbing broke. Confirm runs are tagged `pstar_lr0.001_...` and that `--heat-lr` reaches `run_tier2.py`. |

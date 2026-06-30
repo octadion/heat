@@ -107,12 +107,19 @@ def format_p(p: float) -> str:
     return f"{round(float(p), 6):g}"
 
 
-def variant_tag(p: Optional[float] = None, source: bool = False) -> str:
+def variant_tag(p: Optional[float] = None, source: bool = False,
+                eta: Optional[float] = None) -> str:
+    """Tag for a run. `eta` (the HEAT learning rate) is encoded so runs at
+    different eta -- the swept lever in the eta-sweep -- never collide.
+
+      heat run: pstar_lr<eta>_p<p>      source: pstar_lr<eta>_source
+    """
+    eta_part = f"lr{format_p(eta)}_" if eta is not None else ""
     if source:
-        return "pstar_source"
+        return f"pstar_{eta_part}source"
     if p is None:
         raise ValueError("variant_tag requires p when source=False")
-    return f"pstar_p{format_p(p)}"
+    return f"pstar_{eta_part}p{format_p(p)}"
 
 
 def run_output_path(
@@ -122,8 +129,9 @@ def run_output_path(
     seed: int,
     p: Optional[float] = None,
     source: bool = False,
+    eta: Optional[float] = None,
 ) -> Path:
-    tag = variant_tag(p=p, source=source)
+    tag = variant_tag(p=p, source=source, eta=eta)
     # dataset is always cifar10 here, so dataset_tag is empty (matches run_tier2).
     fname = f"p9_{arch}_{tag}_seed{seed}_sev{severity}.json"
     return Path(results_dir) / fname
@@ -136,18 +144,21 @@ def run_error_path(
     seed: int,
     p: Optional[float] = None,
     source: bool = False,
+    eta: Optional[float] = None,
 ) -> Path:
-    out = run_output_path(results_dir, arch, severity, seed, p=p, source=source)
+    out = run_output_path(results_dir, arch, severity, seed, p=p, source=source, eta=eta)
     return out.with_suffix(".run_error.txt")
 
 
-def discover_p_values(results_dir, arch: str, severity: int, seed: int) -> list[float]:
-    """Every restore-prob whose run JSON exists on disk for (arch, severity).
+def discover_p_values(results_dir, arch: str, severity: int, seed: int,
+                      eta: float) -> list[float]:
+    """Every restore-prob whose run JSON exists on disk for (arch, severity, eta).
 
-    Mirrors analyze_pstar_law.discover_p_values so the sweep can fold the
-    p_ref-ladder rungs (e.g. 0.040 / 0.080) into the bracket search.
+    Filtered to one eta by its formatted tag, so the sweep folds in the
+    eta-scaled p_ref-ladder rungs but never mixes p-observations across etas
+    (choose_pstar/classify_run operate at a FIXED (arch, sev, eta)).
     """
-    prefix = f"p9_{arch}_pstar_p"
+    prefix = f"p9_{arch}_pstar_lr{format_p(eta)}_p"
     suffix = f"_seed{seed}_sev{severity}.json"
     pat = re.compile(re.escape(prefix) + r"(.+?)" + re.escape(suffix) + r"$")
     ps: list[float] = []
@@ -159,6 +170,51 @@ def discover_p_values(results_dir, arch: str, severity: int, seed: int) -> list[
             except ValueError:
                 continue
     return sorted(set(ps))
+
+
+def discover_etas(results_dir, arch: str, severity: int, seed: int) -> list[float]:
+    """Every eta (learning rate) that has at least one heat run on disk for
+    this (arch, severity). Lets the analysis enumerate eta-cells automatically.
+    """
+    suffix = f"_seed{seed}_sev{severity}.json"
+    pat = re.compile(
+        r"^p9_" + re.escape(arch) + r"_pstar_lr(.+?)_p.+?"
+        + re.escape(suffix) + r"$")
+    etas: set[float] = set()
+    for path in Path(results_dir).glob(f"p9_{arch}_pstar_lr*_p*{suffix}"):
+        m = pat.match(path.name)
+        if m:
+            try:
+                etas.add(float(m.group(1)))
+            except ValueError:
+                continue
+    return sorted(etas)
+
+
+# ----------------------------------------------------------------------------
+# eta-scaled p-search grids (CHANGE C). The whole point of the eta-sweep is that
+# p* moves ~linearly with eta over a ~20x range, so a fixed p-grid cannot
+# bracket it. We scale the coarse grid, the p_ref ladder, and the upward-
+# extension grid by (eta / ETA) so each eta-cell has an appropriately-placed
+# search range (e.g. at eta=4e-3, p* ~= 0.038 and p_ref must exceed it).
+# ----------------------------------------------------------------------------
+
+def _scale(values: Sequence[float], eta: float) -> list[float]:
+    factor = float(eta) / ETA
+    return [round(v * factor, 8) for v in values]
+
+
+def scaled_p_grid(eta: float, base: Optional[Sequence[float]] = None) -> list[float]:
+    return _scale(base if base is not None else DEFAULT_P_GRID, eta)
+
+
+def scaled_pref_ladder(arch: str, eta: float) -> list[float]:
+    base = PREF_FALLBACKS.get(arch, [PREF_DEFAULT.get(arch, 0.01)])
+    return _scale(base, eta)
+
+
+def scaled_extend_grid(eta: float) -> list[float]:
+    return _scale(EXTEND_P_GRID, eta)
 
 
 def build_run_command(
@@ -193,14 +249,15 @@ def build_run_command(
         "--out-dir", str(results_dir),
     ]
     if source:
-        cmd += ["--methods", "source", "--variant-tag", variant_tag(source=True)]
+        cmd += ["--methods", "source",
+                "--variant-tag", variant_tag(source=True, eta=heat_lr)]
     else:
         cmd += [
             "--methods", "heat",
             "--heat-lr", repr(float(heat_lr)),
             "--heat-restore-prob", format_p(p if p is not None else 0.0),
             "--heat-diagnostic-snapshot",  # required so drift_l2 exists even at p=0
-            "--variant-tag", variant_tag(p=p),
+            "--variant-tag", variant_tag(p=p, eta=heat_lr),
         ]
     return cmd
 
@@ -506,6 +563,10 @@ __all__ = [
     "run_output_path",
     "run_error_path",
     "discover_p_values",
+    "discover_etas",
+    "scaled_p_grid",
+    "scaled_pref_ladder",
+    "scaled_extend_grid",
     "build_run_command",
     "execute_run",
     "heat_summary",
