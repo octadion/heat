@@ -23,7 +23,7 @@ PASS iff all four checks are sane (printed itemized, like the WRN sanity gate):
 Usage:
   python scripts/run_domainnet_smoke.py \
       --domainnet-root data/domainnet-126 \
-      --ckpt experiments/checkpoints/best_real_2020.pth \
+      --ckpt experiments/checkpoints/best_real_2020.pth.tar \
       --target clipart --heat-lr 1e-3 \
       --p-grid 0.0 0.005 0.02 0.05 --out-dir experiments/results/domainnet_smoke
 """
@@ -57,7 +57,7 @@ def parse_args():
     p.add_argument("--domainnet-root", type=str, required=True,
                    help="Dir with <domain>_list.txt + image folders.")
     p.add_argument("--ckpt", type=str, required=True,
-                   help="AdaContrast source=real checkpoint (best_real_2020.pth).")
+                   help="AdaContrast source=real checkpoint (best_real_2020.pth.tar).")
     p.add_argument("--target", type=str, default="clipart")
     p.add_argument("--heat-lr", type=float, default=1e-3)
     p.add_argument("--p-grid", type=float, nargs="+", default=[0.0, 0.005, 0.02, 0.05])

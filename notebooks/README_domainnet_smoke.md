@@ -40,7 +40,7 @@ unexpected keys.
 ## Resolved sources (verified, not guessed)
 | What | URL | Size / note |
 |---|---|---|
-| Source checkpoints (AdaContrast, seeds 2020/21/22 × 4 domains) | `https://drive.google.com/drive/folders/16vTNNzzAt4M1mmeLsOxSFDRzBogaNkJw` | ~1.1 GB for all; we use `best_real_2020.pth` (ResNet-50 ~90 MB). `gdown --folder`. |
+| Source checkpoints (AdaContrast, seeds 2020/21/22 × 4 domains) | `https://drive.google.com/drive/folders/16vTNNzzAt4M1mmeLsOxSFDRzBogaNkJw` | ~1.1 GB for all; we use **`best_real_2020.pth.tar`** (note `.pth.tar` extension; ResNet-50 ~90 MB). `gdown --folder --remaining-ok`. |
 | Image lists (126-class) | `https://raw.githubusercontent.com/DianCh/AdaContrast/master/datasets/domainnet-126/<domain>_list.txt` | few MB; lines `"<domain>/cat/img.jpg <label>"` |
 | clipart images (cleaned DomainNet) | `http://csr.bu.edu/ftp/visda/2019/multi-source/groundtruth/clipart.zip` | ~1 GB (~48k imgs) — **required** |
 | real images (cleaned DomainNet) | `http://csr.bu.edu/ftp/visda/2019/multi-source/real.zip` | ~5.6 GB — **NOT needed** for this slice (note: `real.zip` is directly under `multi-source/`, not `groundtruth/`) |
