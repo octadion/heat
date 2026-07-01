@@ -240,9 +240,48 @@ def build_run_command(
     p: Optional[float] = None,
     source: bool = False,
     python: Optional[str] = None,
+    dataset: str = "cifar10",
+    data_root: Optional[str] = None,
+    target_domain: Optional[str] = None,
+    method: Optional[str] = None,
+    domainnet_runner: Optional[Path] = None,
 ) -> list[str]:
-    """Construct the run_tier2.py command line for one continual run."""
+    """Construct the command line for one continual run.
+
+    dataset='cifar10' -> run_tier2.py (unchanged CIFAR path).
+    dataset='domainnet126' -> scripts/run_p9_domainnet.py (reuses run_p9 with the
+      resnet50 wrapper + AdaContrast checkpoint). `data_root`/`target_domain` are
+      required; `method` may be 'heat' (default), 'source', or 'bn_adapt'.
+    """
     python = python or sys.executable
+
+    if dataset == "domainnet126":
+        entry = domainnet_runner
+        cmd = [
+            python, str(entry),
+            "--protocol", "p9", "--arch", arch, "--dataset", "domainnet126",
+            "--checkpoint", str(checkpoint), "--data-root", str(data_root),
+            "--target-domain", str(target_domain),
+            "--severity", str(severity), "--seed", str(seed),
+            "--batch-size", str(batch_size), "--num-workers", str(num_workers),
+            "--out-dir", str(results_dir),
+        ]
+        m = method or ("source" if source else "heat")
+        if m == "heat":
+            cmd += ["--methods", "heat",
+                    "--heat-lr", repr(float(heat_lr)),
+                    "--heat-restore-prob", format_p(p if p is not None else 0.0),
+                    "--heat-diagnostic-snapshot",
+                    "--variant-tag", variant_tag(p=p, eta=heat_lr)]
+        elif m == "source":
+            cmd += ["--methods", "source", "--variant-tag", "pstar_source"]
+        elif m == "bn_adapt":
+            cmd += ["--methods", "bn_adapt", "--variant-tag", "pstar_bnadapt"]
+        else:
+            raise ValueError(f"unknown method '{m}' for domainnet126")
+        return cmd
+
+    # ---- CIFAR path (unchanged) ----
     cmd = [
         python, str(run_tier2),
         "--protocol", "p9",
@@ -465,6 +504,34 @@ def heat_lr_of(data: dict[str, Any]) -> float:
 
 
 # ----------------------------------------------------------------------------
+# HARD-only collapse (used for the DomainNet slice, where soft:below_source
+# fires at all p and cannot define a boundary). Separate from classify_run so
+# the CIFAR collapse math stays untouched; `chance_acc` is explicit (126-class
+# DomainNet uses ~0.02, CIFAR-10 uses 0.12).
+# ----------------------------------------------------------------------------
+
+def hard_collapse(data: dict[str, Any], chance_acc: float = CHANCE_ACC) -> dict[str, Any]:
+    """Hard collapse only: NaN/inf in the stream OR mean_accuracy <= chance_acc.
+    Returns {collapsed, criterion, mean_acc, drift, gbar}."""
+    summ = heat_summary(data)
+    rows = stream_rows(data)
+    mean_acc = safe_float(summ.get("mean_accuracy"))
+    gbar_res = grad_norm_gbar(data)
+    out = {
+        "collapsed": False, "criterion": "stable",
+        "mean_acc": mean_acc, "drift": drift_stationary(data),
+        "gbar": gbar_res[0] if gbar_res else None,
+    }
+    if any(_row_nonfinite(r) for r in rows):
+        out["collapsed"] = True
+        out["criterion"] = "hard:nan_inf"
+    elif mean_acc is None or mean_acc <= chance_acc:
+        out["collapsed"] = True
+        out["criterion"] = "hard:chance_acc"
+    return out
+
+
+# ----------------------------------------------------------------------------
 # Collapse criterion (section 6.2). Priority order is enforced.
 # ----------------------------------------------------------------------------
 
@@ -656,6 +723,7 @@ __all__ = [
     "grad_norm_gbar",
     "drift_stationary",
     "heat_lr_of",
+    "hard_collapse",
     "classify_run",
     "choose_pstar",
     "least_squares_line",
