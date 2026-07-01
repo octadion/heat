@@ -151,12 +151,15 @@ def make_plot(rows, source_acc, out_png):
         ax.annotate(f"η={r['eta']:g}" + (" (blowup)" if blow else ""),
                     (x, y), textcoords="offset points", xytext=(6, 4), fontsize=8)
     fit = pc.least_squares_line([x for x, _ in fit_pts], [y for _, y in fit_pts])
-    if fit is not None:
+    if fit is not None and fit_pts:
+        slope, r2 = fit["slope"], fit["r2"]
+        rtxt = f"{1.0/slope:.3g}" if slope else "inf (slope~0)"
+        r2txt = f"{r2:.3f}" if r2 is not None else "n/a"
         xs = [0.0, max(x for x, _ in fit_pts) * 1.1]
-        ax.plot(xs, [fit["slope"] * x + fit["intercept"] for x in xs],
+        ax.plot(xs, [slope * x + fit["intercept"] for x in xs],
                 "--", color="0.3", zorder=2,
-                label=(f"fit: slope={fit['slope']:.3g} (R={1.0/fit['slope']:.3g}), "
-                       f"b={fit['intercept']:.3g}, R²={fit['r2']:.3f}"))
+                label=(f"fit: slope={slope:.3g} (R={rtxt}), "
+                       f"b={fit['intercept']:.3g}, R²={r2txt}"))
     ax.axhline(0, color="0.85", lw=0.8, zorder=0); ax.axvline(0, color="0.85", lw=0.8, zorder=0)
     ax.set_xlabel(r"$\eta \cdot \|\bar{g}\|$   (swept via $\eta$)")
     ax.set_ylabel(r"$p^*$ (min tether avoiding HARD collapse)")
@@ -222,9 +225,20 @@ def main():
 
     # ---- Three-line verdict ----
     R = (1.0 / fit["slope"]) if (fit and fit["slope"]) else None
-    q1 = (f"Q1 (LAW): {'LINEAR' if (fit and fit['r2'] is not None and fit['r2']>=R2_GOOD) else 'NOT clean'} "
-          f"— slope={f(fit['slope']) if fit else 'n/a'} (R={f(R)}), "
-          f"R²={f(fit['r2']) if fit else 'n/a'} over {fit['n'] if fit else 0} genuine points.")
+    n_boundary = sum(1 for r in rows if r["p_star"] is not None and r["p_star"] > 0)
+    eta_max = max(etas) if etas else float("nan")
+    if fit and fit["slope"] and fit["r2"] is not None and fit["r2"] >= R2_GOOD:
+        q1 = (f"Q1 (LAW): LINEAR — slope={fit['slope']:.4g} (R={f(R)}), "
+              f"R²={fit['r2']:.3f} over {fit['n']} genuine points.")
+    elif n_boundary == 0:
+        q1 = (f"Q1 (LAW): NOT TRIGGERED — p*≈0 at every eta (no hard collapse up to "
+              f"eta={eta_max:g}). TFF stays stable in BN-train mode across the grid, so "
+              f"the drift-budget HARD boundary is never reached on real→clipart/resnet50 "
+              f"and the law slope is unmeasurable on this slice (needs a stronger push: "
+              f"higher eta, or a harder shift).")
+    else:
+        q1 = (f"Q1 (LAW): NOT clean — slope={f(fit['slope']) if fit else 'n/a'} (R={f(R)}), "
+              f"R²={f(fit['r2']) if fit else 'n/a'}, {n_boundary} boundary point(s).")
     if best_row is not None and bn_adapt_acc is not None:
         q2 = (f"Q2 (USEFULNESS): TFF best_acc={f(best_row['tff_best_acc'])} "
               f"(eta={best_row['eta']:g}) vs bn_adapt={f(bn_adapt_acc)} — "
