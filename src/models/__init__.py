@@ -25,10 +25,17 @@ def _vit_s_factory(num_classes: int = 10, pretrained: bool = True, **_):
     return vit_s_cifar(num_classes=num_classes, pretrained=pretrained)
 
 
+def _resnet50_domainnet_factory(num_classes: int = 126, **_):
+    # Lazy import: torchvision ResNet-50 only needed for the DomainNet-126 path.
+    from .resnet50_domainnet import resnet50_domainnet
+    return resnet50_domainnet(num_classes=num_classes)
+
+
 ARCH_FACTORY = {
     "resnet18": _resnet18_factory,
     "wrn28_10": _wrn_factory,
     "vit_s": _vit_s_factory,
+    "resnet50": _resnet50_domainnet_factory,
 }
 
 

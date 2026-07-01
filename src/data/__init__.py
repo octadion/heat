@@ -8,6 +8,9 @@ from .cifar10 import (
 from .cifar10c import CIFAR10C, get_cifar10c_loader, CORRUPTIONS, SEVERITIES
 from .cifar100 import get_cifar100_loaders
 from .cifar100c import CIFAR100C, get_cifar100c_loader
+from .domainnet126 import (
+    DomainNet126, get_domainnet126_loader, DOMAINS as DOMAINNET126_DOMAINS,
+)
 
 
 def num_classes_for(dataset: str) -> int:
@@ -16,6 +19,8 @@ def num_classes_for(dataset: str) -> int:
         return 10
     if dataset == "cifar100":
         return 100
+    if dataset == "domainnet126":
+        return 126
     raise ValueError(f"unknown dataset: {dataset}")
 
 
@@ -33,13 +38,19 @@ def get_corruption_loader(dataset: str, root: str, corruption: str,
                           severity: int = 5, batch_size: int = 64,
                           num_workers: int = 2, shuffle: bool = False,
                           arch=None):
-    """Dispatch to cifar10c or cifar100c loader by dataset name."""
+    """Dispatch to cifar10c / cifar100c / domainnet126 loader by dataset name.
+
+    For domainnet126 the `corruption` argument is the target DOMAIN name and
+    `severity` is ignored (DomainNet has no severities)."""
     if dataset == "cifar10":
         return get_cifar10c_loader(root, corruption, severity,
                                    batch_size, num_workers, shuffle, arch=arch)
     if dataset == "cifar100":
         return get_cifar100c_loader(root, corruption, severity,
                                     batch_size, num_workers, shuffle, arch=arch)
+    if dataset == "domainnet126":
+        return get_domainnet126_loader(root, corruption, severity,
+                                       batch_size, num_workers, shuffle, arch=arch)
     raise ValueError(f"unknown dataset: {dataset}")
 
 
@@ -56,6 +67,9 @@ __all__ = [
     "get_cifar100_loaders",
     "CIFAR100C",
     "get_cifar100c_loader",
+    "DomainNet126",
+    "get_domainnet126_loader",
+    "DOMAINNET126_DOMAINS",
     "num_classes_for",
     "get_clean_loaders",
     "get_corruption_loader",
