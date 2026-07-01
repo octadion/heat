@@ -54,6 +54,9 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=2)
+    # Numeric regime: inherit (default; == CIFAR/run_tier2, comparable across
+    # experiments), on (fast A100, differs), off (full FP32, most reproducible).
+    p.add_argument("--tf32-mode", choices=["inherit", "on", "off"], default="inherit")
     return p.parse_args()
 
 
@@ -79,6 +82,7 @@ def ensure_run(args, *, method="heat", p=None, eta=pc.ETA, log=""):
         heat_lr=eta, batch_size=args.batch_size, num_workers=args.num_workers, p=p,
         dataset="domainnet126", data_root=args.data_root,
         target_domain=args.target_domain, method=method, domainnet_runner=DN_RUNNER,
+        tf32_mode=args.tf32_mode,
     )
     t0 = time.time()
     ok, tail = pc.execute_run(cmd, log_prefix=log)
@@ -147,7 +151,11 @@ def main():
     Path(args.results_dir).mkdir(parents=True, exist_ok=True)
     etas = sorted(set(args.etas), reverse=True)  # DESCENDING
     print(f"[dn-sweep] resnet50 source=real target={args.target_domain} seed={args.seed}")
-    print(f"[dn-sweep] etas(desc)={[pc.format_p(e) for e in etas]} chance_acc={args.chance_acc}")
+    print(f"[dn-sweep] etas(desc)={[pc.format_p(e) for e in etas]} chance_acc={args.chance_acc} "
+          f"tf32_mode={args.tf32_mode}"
+          + (" (== CIFAR/run_tier2 defaults; comparable)" if args.tf32_mode == "inherit"
+             else (" (force FP32; most reproducible)" if args.tf32_mode == "off"
+                   else " (force TF32; fast A100 but differs from CIFAR)")))
 
     # Baselines (eta-independent): run once.
     print("\n[dn-sweep] baselines (source, bn_adapt) ...", flush=True)

@@ -50,6 +50,15 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--variant-tag", type=str, default="")
     p.add_argument("--out-dir", type=str, required=True)
+    # Numeric regime (matters for cross-EXPERIMENT comparability, not just speed):
+    #   inherit (default) : leave torch backends at their defaults -- IDENTICAL to
+    #       run_tier2.py, so DomainNet is comparable to the existing CIFAR sweep
+    #       (matmul FP32, cudnn-conv TF32 on, benchmark off). RECOMMENDED.
+    #   on      : force TF32 (matmul+conv) + cudnn.benchmark -> fast on A100 but
+    #       DIFFERS from CIFAR/default; use only for a one-off speed run.
+    #   off     : force full FP32 + benchmark off -> max cross-GPU reproducibility
+    #       (use for ALL experiments if you adopt FP32 as the fixed convention).
+    p.add_argument("--tf32-mode", choices=["inherit", "on", "off"], default="inherit")
     return p.parse_args()
 
 
@@ -60,6 +69,26 @@ def main():
         pass
     a = parse_args()
     device = get_device()
+    # Numeric regime (batch/steps UNCHANGED, so this only sets the precision path).
+    # 'inherit' touches nothing -> identical to run_tier2/CIFAR (comparable). 'on'
+    # forces TF32+autotune (fast A100, differs). 'off' forces FP32 (reproducible).
+    try:
+        import torch
+        if torch.cuda.is_available():
+            if a.tf32_mode == "on":
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                torch.backends.cudnn.benchmark = True
+            elif a.tf32_mode == "off":
+                torch.backends.cuda.matmul.allow_tf32 = False
+                torch.backends.cudnn.allow_tf32 = False
+                torch.backends.cudnn.benchmark = False
+            # 'inherit': leave torch defaults untouched (== run_tier2 / CIFAR).
+        print(f"[perf] tf32_mode={a.tf32_mode}"
+              + (" (== CIFAR/run_tier2 defaults)" if a.tf32_mode == "inherit" else ""),
+              flush=True)
+    except Exception:
+        pass
     out_dir = Path(a.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 

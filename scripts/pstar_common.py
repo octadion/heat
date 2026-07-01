@@ -245,6 +245,7 @@ def build_run_command(
     target_domain: Optional[str] = None,
     method: Optional[str] = None,
     domainnet_runner: Optional[Path] = None,
+    tf32_mode: str = "inherit",
 ) -> list[str]:
     """Construct the command line for one continual run.
 
@@ -265,6 +266,7 @@ def build_run_command(
             "--severity", str(severity), "--seed", str(seed),
             "--batch-size", str(batch_size), "--num-workers", str(num_workers),
             "--out-dir", str(results_dir),
+            "--tf32-mode", str(tf32_mode),
         ]
         m = method or ("source" if source else "heat")
         if m == "heat":
