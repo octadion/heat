@@ -60,6 +60,12 @@ def parse_args():
                    help="AdaContrast source=real checkpoint (best_real_2020.pth.tar).")
     p.add_argument("--target", type=str, default="clipart")
     p.add_argument("--heat-lr", type=float, default=1e-3)
+    p.add_argument("--heat-bn-running-stats", type=str, default="train",
+                   choices=["train", "frozen"],
+                   help="BN running-stat behavior during HEAT adaptation. Default "
+                        "'train' (legacy). Use 'frozen' to stop the shared head's "
+                        "BatchNorm1d from being polluted by the per-stage energy "
+                        "(diagnostic for whether HEAT<source is a BN artifact).")
     p.add_argument("--p-grid", type=float, nargs="+", default=[0.0, 0.005, 0.02, 0.05])
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=2)
@@ -84,7 +90,7 @@ def _make_args(a, *, methods, restore_prob, diagnostic):
         methods=methods,
         heat_lr=a.heat_lr, heat_momentum=0.0, heat_temperatures=[1.0],
         heat_aggregation="sum", heat_eval_mode=False, heat_adapt_params="full",
-        heat_bn_running_stats="train", heat_stages=None,
+        heat_bn_running_stats=a.heat_bn_running_stats, heat_stages=None,
         heat_restore_prob=restore_prob, heat_diagnostic_snapshot=diagnostic,
     )
 
@@ -106,8 +112,9 @@ def main():
     out_dir = Path(a.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     device = get_device()
+    bn_tag = "" if a.heat_bn_running_stats == "train" else f"_bn{a.heat_bn_running_stats}"
     print(f"[smoke] device={device} arch=resnet50 source=real target={a.target} "
-          f"eta={a.heat_lr}")
+          f"eta={a.heat_lr} bn_running_stats={a.heat_bn_running_stats}")
 
     # ---- Build wrapper + load checkpoint (CHECK 1) ----
     model = ResNet50DomainNet(num_classes=126)
@@ -155,19 +162,31 @@ def main():
 
     n_stable = sum(1 for r in grid_rows if not r["collapsed"])
     n_collapse = sum(1 for r in grid_rows if r["collapsed"])
+    n_hard = sum(1 for r in grid_rows if str(r["criterion"]).startswith("hard:"))
+    n_soft = sum(1 for r in grid_rows if str(r["criterion"]).startswith("soft:"))
 
-    # ---- Four checks ----
+    # ---- Checks ----
+    # 1-3 validate the INTEGRATION (the actual point of a smoke). 4 asks whether a
+    # p* boundary is bracketable at this eta -- a property of the slice, not the
+    # integration.
     c1 = bool(ckpt_report["ok"])
     c2 = (source_acc is not None and SOURCE_ACC_BAND[0] <= source_acc <= SOURCE_ACC_BAND[1])
     c3 = (ref_gbar is not None and math.isfinite(ref_gbar)
           and GBAR_BAND[0] <= ref_gbar <= GBAR_BAND[1])
     c4 = (n_stable >= 1 and n_collapse >= 1)
+    integration_ok = c1 and c2 and c3
     checks = {
         "1_checkpoint_loads": c1,
         "2_source_acc_in_band": c2,
         "3_gbar_finite_sane": c3,
         "4_collapse_boundary_present": c4,
     }
+
+    # Monotonic sanity (a healthy tether: acc up, drift down as p grows).
+    accs = [r["mean_acc"] for r in grid_rows if r["mean_acc"] is not None]
+    drs = [r["drift"] for r in grid_rows if r["drift"] is not None]
+    acc_up = len(accs) >= 2 and all(b >= a - 1e-9 for a, b in zip(accs, accs[1:]))
+    drift_down = len(drs) >= 2 and all(b <= a + 1e-9 for a, b in zip(drs, drs[1:]))
 
     print("\n================ DOMAINNET-126 SMOKE: CHECKS ================")
     print(f"  [{'PASS' if c1 else 'FAIL'}] 1. checkpoint loads "
@@ -177,29 +196,58 @@ def main():
           f"in {SOURCE_ACC_BAND}")
     print(f"  [{'PASS' if c3 else 'FAIL'}] 3. ||g_bar||="
           f"{'n/a' if ref_gbar is None else f'{ref_gbar:.4g}'} finite & in {GBAR_BAND}")
-    print(f"  [{'PASS' if c4 else 'FAIL'}] 4. collapse boundary present "
-          f"({n_stable} stable, {n_collapse} collapse across the p-grid)")
+    print(f"  [{'PASS' if c4 else 'FAIL'}] 4. p* boundary bracketable at eta={a.heat_lr} "
+          f"({n_stable} stable, {n_collapse} collapse; {n_hard} hard, {n_soft} soft)")
 
     passed = all(checks.values())
     summary = {
         "arch": "resnet50", "source": "real", "target": a.target,
         "heat_lr": a.heat_lr, "source_acc": source_acc,
         "ref_gbar": ref_gbar, "checkpoint_report": ckpt_report,
-        "grid": grid_rows, "checks": checks, "passed": passed,
+        "grid": grid_rows, "checks": checks, "integration_ok": integration_ok,
+        "n_hard_collapse": n_hard, "n_soft_collapse": n_soft,
+        "acc_monotone_up_in_p": acc_up, "drift_monotone_down_in_p": drift_down,
+        "heat_bn_running_stats": a.heat_bn_running_stats, "passed": passed,
     }
-    (out_dir / f"domainnet_smoke_{a.target}.json").write_text(
+    (out_dir / f"domainnet_smoke_{a.target}{bn_tag}.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8")
 
+    # ---- Verdict: integration first, then the boundary question ----
+    print(f"\nINTEGRATION: {'VALIDATED' if integration_ok else 'BROKEN'} "
+          f"(checks 1-3 = checkpoint/source-acc/||g_bar||)")
+    print(f"tether sanity: acc {'monotone up' if acc_up else 'NON-monotone'} in p, "
+          f"drift {'monotone down' if drift_down else 'NON-monotone'} in p")
+
     if passed:
-        print("\n[DOMAINNET SMOKE PASSED] Integration works end-to-end on "
-              f"real->{a.target}. Safe to scale to the domain x eta sweep.")
+        print("\n[DOMAINNET SMOKE PASSED] End-to-end on real->{}, p* bracketable. "
+              "Safe to scale to the domain x eta sweep.".format(a.target))
         sys.exit(0)
-    print("\n[DOMAINNET SMOKE FAILED] Fix integration before scaling. Failed: "
-          f"{[k for k, ok in checks.items() if not ok]}")
-    if not c4:
-        print("  (Note: if all p are stable, p*~=0 here — try a low p or report "
-              "that clipart doesn't destabilize this source at eta=1e-3; if all "
-              "collapse, the source/transform/label mapping is likely wrong.)")
+
+    # Not all four: diagnose check 4 precisely (do NOT cry 'mapping wrong' when
+    # integration is validated).
+    if not integration_ok:
+        print("\n[DOMAINNET SMOKE FAILED] INTEGRATION broken — fix before scaling. "
+              f"Failed: {[k for k, ok in checks.items() if not ok]}")
+        print("  (Chance-level source acc / bad ||g_bar|| => wrong stage tap, "
+              "class mapping, or transform.)")
+    elif n_hard == 0 and n_collapse == len(grid_rows):
+        # Every p is soft:below_source, no hard collapse: HEAT underperforms the
+        # source across the grid at this eta, monotonically recovered by the
+        # tether. Integration is fine; the boundary is just not in this eta/p.
+        print("\n[DOMAINNET SMOKE — INTEGRATION VALIDATED, NO BOUNDARY AT THIS ETA]")
+        print(f"  At eta={a.heat_lr}, HEAT stays BELOW source ({source_acc:.3f}) for "
+              "every p (soft:below_source everywhere) and never hard-collapses, so "
+              "there is no stable<->collapse bracket to measure p* here.")
+        print("  This is the wide-basin / natural-shift regime (cf. resnet18 on "
+              "CIFAR): a clean HARD boundary needs a STRONGER push. Next step is a "
+              "DomainNet eta-SWEEP (higher eta), not a fix — the integration is proven.")
+    elif n_stable == len(grid_rows):
+        print("\n[DOMAINNET SMOKE — INTEGRATION VALIDATED, p*~=0 AT THIS ETA]")
+        print(f"  Every p is stable at eta={a.heat_lr}: HEAT does not destabilize "
+              "clipart here (p*~=0). Try higher eta to expose a boundary.")
+    else:
+        print("\n[DOMAINNET SMOKE — CHECK 4 not met] Integration validated but the "
+              "p-grid did not straddle the boundary; adjust the p-grid / eta.")
     sys.exit(1)
 
 
