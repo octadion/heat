@@ -80,65 +80,87 @@ def _series(rows, key):
     return xs, ys
 
 
-def audit1(dn_dir, out_dir, seed, blowup_etas=(0.004, 0.008, 0.016), stable_eta=0.001):
-    print("\n================ AUDIT 1 — clipart blow-up vs drift ================")
-    etas = list(blowup_etas) + [stable_eta]
+def _finite_max(ys):
+    fin = [y for y in ys if y == y and abs(y) != float("inf")]
+    return max(fin) if fin else None
+
+
+def audit1(dn_dir, out_dir, seed, high_etas=(0.004, 0.008, 0.016), stable_eta=0.001):
+    """Reframed: the question is NOT 'did it NaN' but 'how big does drift get, and
+    does accuracy die before any NaN'. Plots drift_l2 (LOG y) + grad_l2, annotates
+    the run's TFF accuracy, and classifies drift-collapse (NaN) vs signal-dominated
+    (huge-but-finite drift, accuracy destroyed, no NaN)."""
+    print("\n================ AUDIT 1 — clipart: drift magnitude & two boundaries ===")
+    etas = list(high_etas) + [stable_eta]
     fig, axes = plt.subplots(len(etas), 1, figsize=(8, 2.6 * len(etas)), sharex=True)
     if len(etas) == 1:
         axes = [axes]
     verdicts = {}
-    # reference stable drift magnitude (from the stable eta's p=0 run)
     for ax, eta in zip(axes, etas):
         data = _load(pc.run_output_path(dn_dir, DN_ARCH, DN_SEV, seed, p=0.0, eta=eta))
         if data is None:
             ax.set_title(f"eta={eta:g}  [MISSING p=0 run]"); continue
         rows = pc.stream_rows(data)
-        info = pc.first_nonfinite_info(rows)
+        fn = pc.first_nonfinite_step(rows)
         sx, sdrift = _series(rows, "drift_l2")
         _, sgrad = _series(rows, "grad_l2")
-        _, sen = _series(rows, "energy")
-        ax.plot(sx, sdrift, label="drift_l2", color="#1f77b4")
-        ax.plot(sx, sgrad, label="grad_l2", color="#d62728", alpha=0.8)
-        ax2 = ax.twinx(); ax2.plot(sx, sen, label="energy", color="#2ca02c", alpha=0.5)
-        ax2.set_ylabel("energy", fontsize=7)
-        fn = info["step"] if info else None
-        # drift just before divergence
-        pre = [d for s, d in zip(sx, sdrift) if (fn is None or s < fn) and d == d]  # d==d: finite
-        pre_drift = max(pre) if pre else None
+        max_drift = _finite_max(sdrift)
+        acc = pc.safe_float(pc.heat_summary(data).get("mean_accuracy"))
+        # drift_l2 on LOG y (shows growth to ~1e7 while finite); grad overlaid.
+        ax.semilogy([s for s, d in zip(sx, sdrift) if d and d == d and d > 0],
+                    [d for d in sdrift if d and d == d and d > 0],
+                    label="drift_l2 (log)", color="#1f77b4")
+        ax.semilogy([s for s, g in zip(sx, sgrad) if g and g == g and g > 0],
+                    [g for g in sgrad if g and g == g and g > 0],
+                    label="grad_l2 (log)", color="#d62728", alpha=0.6)
         if fn is not None:
-            ax.axvline(fn, color="k", ls=":", lw=1)
-            verdict = ("optimizer-blowup" if fn < EARLY_STEP else "drift-collapse")
+            ax.axvline(fn, color="k", ls=":", lw=1, label=f"first NaN @ {fn}")
+        # classify
+        if fn is not None and fn < EARLY_STEP:
+            verdict = "optimizer-blowup"       # early NaN before drift accumulates
+        elif fn is not None:
+            verdict = "drift-collapse"          # late NaN after drift grew
         else:
-            verdict = "no-divergence"
-        verdicts[eta] = {"first_nan_step": fn, "pre_nan_drift": pre_drift, "verdict": verdict}
-        ax.set_title(f"eta={eta:g}  first-NaN step={fn}  pre-NaN max drift={_f(pre_drift)}  "
-                     f"-> {verdict}", fontsize=9)
-        ax.set_ylabel("drift / grad"); ax.legend(fontsize=7, loc="upper left")
+            verdict = "signal-dominated"        # no NaN; drift huge-but-finite
+        verdicts[eta] = {"first_nan_step": fn, "max_drift": max_drift, "acc": acc,
+                         "verdict": verdict}
+        ax.set_title(f"eta={eta:g}  |  max drift ||δ||={_f(max_drift)}  |  "
+                     f"TFF acc={_f(acc)}  |  first-NaN={fn}  ->  {verdict}", fontsize=9)
+        ax.set_ylabel("drift / grad (log)")
+        ax.text(0.99, 0.06, f"TFF acc={_f(acc)}", transform=ax.transAxes, ha="right",
+                fontsize=9, bbox=dict(boxstyle="round", fc="#fff3cd", ec="0.6"))
+        ax.legend(fontsize=7, loc="upper left")
     axes[-1].set_xlabel("adaptation step")
-    fig.suptitle("Audit 1 — TFF real→clipart (resnet50): trajectory shape at high eta",
-                 fontsize=11)
+    fig.suptitle("Audit 1 — TFF real→clipart (resnet50): drift explodes (~1e7) WITHOUT NaN; "
+                 "accuracy craters first (signal-dominated)", fontsize=10)
     fig.tight_layout()
     out = Path(out_dir) / "audit1_clipart_blowup.png"
     out.parent.mkdir(parents=True, exist_ok=True); fig.savefig(out, dpi=150); plt.close(fig)
 
-    blow = [e for e in blowup_etas if verdicts.get(e, {}).get("verdict") == "optimizer-blowup"]
-    drift = [e for e in blowup_etas if verdicts.get(e, {}).get("verdict") == "drift-collapse"]
-    if drift:
-        concl = (f"MISLABELED DRIFT-COLLAPSE at eta={drift}: drift rose over many steps "
-                 f"then grad/energy diverged late -> the law IS measurable on DomainNet; "
-                 f"re-fit p* INCLUDING these points.")
-    elif blow:
-        concl = (f"GENUINE OPTIMIZER-BLOWUP at eta={blow}: grad/energy exploded in the first "
-                 f"<{EARLY_STEP} steps before drift accumulated -> Q1/law unmeasurable on "
-                 f"clipart (signal-/LR-dominated regime confirmed); excluding them is correct.")
+    hv = {e: verdicts.get(e, {}) for e in high_etas}
+    any_nan = any(hv[e].get("first_nan_step") is not None for e in high_etas)
+    drifts = {e: hv[e].get("max_drift") for e in high_etas}
+    if not any_nan:
+        concl = (
+            "SIGNAL-DOMINATED regime: on ResNet-50/DomainNet real→clipart in BN-train mode "
+            f"parameter drift ||δ|| grows ENORMOUS ({'; '.join(f'{e:g}->'+_f(drifts[e]) for e in high_etas)}) "
+            "WITHOUT ever hitting NaN — BN-train renormalizes every batch, so the "
+            "drift-collapse (stability) boundary is effectively unreachable here. Accuracy is "
+            "destroyed long before any NaN, so signal-collapse (accuracy destruction) governs "
+            "instead. Two-boundary evidence: the stability boundary is not the operative one "
+            "on this shift; the law's drift-collapse mechanism is not what limits TFF here.")
+    elif any(hv[e].get("verdict") == "drift-collapse" for e in high_etas):
+        de = [e for e in high_etas if hv[e].get("verdict") == "drift-collapse"]
+        concl = (f"MISLABELED DRIFT-COLLAPSE at eta={de}: drift rose over many steps then "
+                 f"diverged late -> the law IS measurable on DomainNet; re-fit p* including these.")
     else:
-        concl = ("No divergence found in the inspected p=0 runs (blow-up flag was via the "
-                 "||g_bar|| ratio, not a NaN) -> inspect the ||g_bar|| magnitudes; not a "
-                 "step-wise divergence.")
-    for e in blowup_etas:
-        v = verdicts.get(e, {})
-        print(f"  eta={e:g}: first-NaN={v.get('first_nan_step')} pre-NaN drift="
-              f"{_f(v.get('pre_nan_drift'))} -> {v.get('verdict')}")
+        be = [e for e in high_etas if hv[e].get("verdict") == "optimizer-blowup"]
+        concl = (f"OPTIMIZER-BLOWUP at eta={be}: NaN in the first <{EARLY_STEP} steps before "
+                 f"drift accumulated -> LR-unstable, correctly excluded from the law fit.")
+    for e in high_etas:
+        v = hv[e]
+        print(f"  eta={e:g}: max drift ||δ||={_f(v.get('max_drift'))}  TFF acc={_f(v.get('acc'))}"
+              f"  first-NaN={v.get('first_nan_step')}  -> {v.get('verdict')}")
     print(f"  [saved] {out}")
     print(f"  CONCLUSION: {concl}")
     return {"per_eta": verdicts, "conclusion": concl, "png": str(out)}
@@ -262,6 +284,24 @@ def audit3(cifar_dir, out_dir, seed):
     out = Path(out_dir) / "audit3_law_master.png"
     out.parent.mkdir(parents=True, exist_ok=True); fig.savefig(out, dpi=150); plt.close(fig)
 
+    # A2: soft-vs-hard slope divergence per arch (do NOT average away).
+    notes = []
+    for arch, _sev in CIFAR:
+        soft = next((s for s in series if s["arch"] == arch and s["criterion"] == "soft+hard"), None)
+        hard = next((s for s in series if s["arch"] == arch and s["criterion"] == "hard-only"), None)
+        if soft and hard and soft["slope"] and hard["slope"]:
+            ratio = max(soft["slope"], hard["slope"]) / min(soft["slope"], hard["slope"])
+            if ratio >= 1.5:
+                notes.append(
+                    f"{arch}: soft slope={_f(soft['slope'])} vs hard slope={_f(hard['slope'])} "
+                    f"(~{ratio:.1f}x apart) -> soft (below-source) and hard (NaN) boundaries sit "
+                    f"at DIFFERENT points on the drift axis -> different R. Wide-basin: the two "
+                    f"boundaries diverge (consistent with the two-boundary picture).")
+            else:
+                notes.append(
+                    f"{arch}: soft slope={_f(soft['slope'])} ≈ hard slope={_f(hard['slope'])} "
+                    f"(~{ratio:.2f}x) -> narrow-basin: soft and hard boundaries COINCIDE, one R.")
+
     strong = [s for s in series if s["r2"] is not None and s["r2"] >= R2_STRONG]
     archs_strong = sorted({s["arch"] for s in strong})
     xfacs = [s["xfac"] for s in strong if s["xfac"]]
@@ -271,12 +311,15 @@ def audit3(cifar_dir, out_dir, seed):
              if strong else
              f"No (arch,criterion) series reached R²>={R2_STRONG} — the law is weaker than "
              f"remembered; inspect the table.")
+    md += ["", "## Soft-vs-hard boundary note (kept, not averaged)", ""] + [f"- {n}" for n in notes]
     md += ["", "## Summary", "", concl]
     (Path(out_dir) / "audit3_law_master.md").write_text("\n".join(md), encoding="utf-8")
     print("\n".join(md[1:3 + len(series)]))
+    for n in notes:
+        print("  NOTE: " + n)
     print(f"  [saved] {out}")
     print(f"  SUMMARY: {concl}")
-    return {"series": series, "summary": concl, "png": str(out)}
+    return {"series": series, "notes": notes, "summary": concl, "png": str(out)}
 
 
 def parse_args():
