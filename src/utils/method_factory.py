@@ -19,7 +19,8 @@ import torch
 import torch.nn as nn
 
 from src.methods import (
-    HEAT, EPOTTA, ReTTA, Tent, TEA, TEANoNoise, TEADirectEnergy,
+    HEAT, HeatAnchor, HeatEntropyDrive,
+    EPOTTA, ReTTA, Tent, TEA, TEANoNoise, TEADirectEnergy,
     Source, BNAdapt, EATA, SAR, PeriodicReset, select_norm_affine_params,
 )
 from src.methods.eata import compute_fisher_diagonal
@@ -156,8 +157,22 @@ def _build_method_impl(name, base_model, device, args, dataset_root="data/cifar1
         )
     if name == "heat":
         adapt_params = getattr(args, "heat_adapt_params", "full")
-        return HEAT(
-            model,
+        # Stage-1b additive variants, dispatched by flags. With the default
+        # flags (anchor_lambda=0, drive='energy') the plain-HEAT path below is
+        # taken unchanged — bit-identical to pre-patch behavior.
+        anchor_lambda = float(getattr(args, "heat_anchor_lambda", 0.0) or 0.0)
+        drive = getattr(args, "drive", "energy") or "energy"
+        restore_prob = getattr(args, "heat_restore_prob", 0.0)
+        if anchor_lambda > 0.0 and restore_prob > 0.0:
+            raise ValueError(
+                "--heat-anchor-lambda is mutually exclusive with "
+                "--heat-restore-prob > 0 (the anchor replaces the Bernoulli "
+                "restore).")
+        if anchor_lambda > 0.0 and drive != "energy":
+            raise ValueError(
+                "--heat-anchor-lambda with --drive entropy is out of scope "
+                "(E6 is defined on the free-energy drive).")
+        common = dict(
             lr=getattr(args, "heat_lr", 1e-3),
             momentum=getattr(args, "heat_momentum", 0.0),
             stages=_heat_stages_for(args, model),
@@ -166,8 +181,24 @@ def _build_method_impl(name, base_model, device, args, dataset_root="data/cifar1
             aggregation=getattr(args, "heat_aggregation", "sum"),
             update_all_params=(adapt_params == "full"),
             bn_running_stats=getattr(args, "heat_bn_running_stats", "train"),
-            restore_prob=getattr(args, "heat_restore_prob", 0.0),
+        )
+        if anchor_lambda > 0.0:
+            return HeatAnchor(
+                model, anchor_lambda=anchor_lambda, restore_prob=0.0,
+                **common,
+            ).to(device)
+        if drive == "entropy":
+            return HeatEntropyDrive(
+                model,
+                restore_prob=restore_prob,
+                diagnostic_snapshot=getattr(args, "heat_diagnostic_snapshot", False),
+                **common,
+            ).to(device)
+        return HEAT(
+            model,
+            restore_prob=restore_prob,
             diagnostic_snapshot=getattr(args, "heat_diagnostic_snapshot", False),
+            **common,
         ).to(device)
     if name == "heat_singlestage":
         # HEAT with a single stage = the final (output-side) stage only.
@@ -254,6 +285,19 @@ def add_method_args(parser):
     parser.add_argument("--heat-diagnostic-snapshot", action="store_true",
                     help="Store source snapshot for diagnostics only. "
                          "Needed to measure drift_l2 when restore_prob=0.")
+    # Stage-1b additive variants (defaults preserve plain HEAT exactly).
+    parser.add_argument("--heat-anchor-lambda", type=float, default=0.0,
+                        help="E6 L2 weight-anchor strength: after each SGD "
+                             "step, theta <- theta - eta*lambda*(theta - "
+                             "theta_source) on all adapted params. Mutually "
+                             "exclusive with --heat-restore-prob > 0. "
+                             "Default 0 = plain HEAT/TFF.")
+    parser.add_argument("--drive", type=str, default="energy",
+                        choices=["energy", "entropy"],
+                        help="E7 adaptation-loss drive for HEAT/TFF: 'energy' "
+                             "(default, free-energy — unchanged) or 'entropy' "
+                             "(mean prediction entropy of the batch; identical "
+                             "optimizer/params/restore/diagnostics).")
     # Explicit HEAT stage selection. Default (None) is "all stages" — exactly
     # the prior behavior. Used by the heat_singlestage ablation variant and
     # available as a manual override for plain `heat` too. Bit-identical to
