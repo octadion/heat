@@ -225,6 +225,16 @@ def e1_verdict(fits, ref_fit, family: str):
               for c, info in fits["per_corruption"].items()
               if info["fit"] is not None}
     checks = {"family": family, "slopes": slopes}
+    # PERMANENT RULE (Stage-1b audit, F2): no reference discoverable =>
+    # verdict VOID, never a curve verdict.
+    if ref_fit is None:
+        checks["verdict"] = "VOID"
+        checks["why"] = ("continual eta-sweep reference fit not discoverable "
+                         "in the results dir — no curve verdict may be "
+                         "emitted (permanent rule). Point the analysis at the "
+                         "dir holding the eta-sweep JSONs "
+                         "(--etasweep-results-dir).")
+        return checks
     if len(slopes) < 2:
         checks["verdict"] = "UNRESOLVED"
         checks["why"] = (f"only {len(slopes)} corruption(s) have a fittable "

@@ -28,7 +28,9 @@ orchestrators and their analyses must agree on exactly:
 from __future__ import annotations
 
 import re
+import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import pvariance
 from typing import Any, Optional
@@ -230,6 +232,123 @@ def analyze_cell_generic(results_dir, arch, corruption, severity, eta, seed,
         "values_run": values, "per_value": per_v,
         "hard": hard_sel, "soft": soft_sel,
     }
+
+
+# ----------------------------------------------------------------------------
+# PERMANENT METHODOLOGICAL-INTEGRITY RULES (Stage-1b audit, F2/F3 fixes).
+# Apply to ALL analyzers/orchestrators from E6/E7 onward (Stage 2+ included):
+#
+#   RULE 1 (VOID guard): if no reference points are discoverable (e.g. zero
+#     Bernoulli hard points for a cross-mechanism fit), the verdict is VOID —
+#     never a curve verdict. A boundary-resolution anomaly (p*=0 with the
+#     non-monotone stable-below-collapse note) also voids the verdict:
+#     instrument failure until proven otherwise.
+#
+#   RULE 2 (loud abort): orchestrators must ABORT before running anything if
+#     the expected E1 reference files are absent from RESULTS_DIR — silent
+#     re-running of references is forbidden — unless --fresh-reference is
+#     explicitly passed (recorded in the manifest and predictions file).
+#
+#   RULE 3 (predictions validity): an existing pre-registration file is
+#     INVALID by default. The orchestrator refuses to proceed until the caller
+#     chooses: --trust-existing-predictions (the audit confirmed the reference
+#     ||g_bar|| runs were genuine) or --requarantine-predictions (quarantine
+#     the old file to analysis/quarantine/ with a note, then re-freeze new
+#     predictions BEFORE any new grid run).
+# ----------------------------------------------------------------------------
+
+VOID = "VOID"
+
+
+def require_e1_reference(results_dir, cells, severity, seed,
+                         fresh_ok: bool) -> list[dict]:
+    """RULE 2. `cells` = [(corruption, eta), ...] the campaign will use.
+    Returns the missing-reference report (empty if all present). Aborts loudly
+    when anything is missing and fresh_ok is False."""
+    missing = []
+    for corruption, eta in cells:
+        src_ok = sc.run_output_path_sc(results_dir, sc.E1_ARCH, corruption,
+                                       severity, seed, source=True,
+                                       eta=eta).exists()
+        n_pts = len(sc.discover_p_values_sc(results_dir, sc.E1_ARCH,
+                                            corruption, severity, seed, eta))
+        if not src_ok or n_pts == 0:
+            missing.append({"corruption": corruption, "eta": eta,
+                            "source_present": src_ok,
+                            "n_e1_heat_runs": n_pts})
+    if missing and not fresh_ok:
+        lines = "\n".join(
+            f"    {m['corruption']} eta={pc.format_p(m['eta'])}: "
+            f"source={'ok' if m['source_present'] else 'MISSING'}, "
+            f"E1 heat runs={m['n_e1_heat_runs']}" for m in missing)
+        raise SystemExit(
+            "[ABORT — RULE 2] expected E1 reference files are absent from "
+            f"this RESULTS_DIR ({results_dir}):\n{lines}\n"
+            "  A campaign here would silently re-run references and be blind "
+            "to the Bernoulli baseline (the exact failure of the voided "
+            "Stage-1b run). Point --results-dir at the dir that holds the E1 "
+            "JSONs, or pass --fresh-reference to proceed deliberately.")
+    if missing:
+        print(f"[RULE 2] --fresh-reference: proceeding WITHOUT {len(missing)} "
+              f"expected E1 reference cell(s); recorded.", flush=True)
+    return missing
+
+
+def quarantine_file(path: Path, reason: str) -> Path:
+    """Move a file to <parent>/quarantine/ with a note — never overwritten."""
+    qdir = path.parent / "quarantine"
+    qdir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = qdir / f"{path.name}.{stamp}"
+    shutil.move(str(path), str(dest))
+    (qdir / f"{path.name}.{stamp}.note.md").write_text(
+        f"Quarantined {path.name} at {stamp} UTC.\nReason: {reason}\n",
+        encoding="utf-8")
+    return dest
+
+
+def resolve_predictions_policy(pred_path: Path, trust: bool,
+                               requarantine: bool) -> str:
+    """RULE 3. Returns 'fresh' (no file / after quarantine) or 'use'."""
+    if trust and requarantine:
+        raise SystemExit("[ABORT] pass only ONE of "
+                         "--trust-existing-predictions / "
+                         "--requarantine-predictions.")
+    if not pred_path.exists():
+        return "fresh"
+    if trust:
+        print(f"[RULE 3] trusting existing pre-registration {pred_path.name} "
+              f"(audit-confirmed).", flush=True)
+        return "use"
+    if requarantine:
+        dest = quarantine_file(
+            pred_path, "pre-registration declared INVALID (reference runs "
+                       "not confirmed genuine by the Stage-1b audit); "
+                       "re-freezing new predictions before any new grid.")
+        print(f"[RULE 3] quarantined old pre-registration -> {dest}", flush=True)
+        return "fresh"
+    raise SystemExit(
+        f"[ABORT — RULE 3] {pred_path} already exists and pre-registered "
+        "predictions are INVALID by default after the voided campaign.\n"
+        "  Pass --trust-existing-predictions ONLY if the audit confirmed the "
+        "reference ||g_bar|| runs were genuine (correct checkpoint + correct "
+        "dispatch), or --requarantine-predictions to quarantine it and "
+        "re-freeze new predictions before any new grid run.")
+
+
+def void_if_no_reference(n_reference_points: int, n_own_points: int,
+                         anomalous_cells: list[str], what: str):
+    """RULE 1. Returns (verdict_or_None, reason). None => not void."""
+    if n_reference_points == 0:
+        return VOID, (f"zero {what} reference points discoverable — no curve "
+                      "verdict may be emitted (permanent rule).")
+    if n_own_points == 0:
+        return VOID, "zero measured boundary points — nothing to fit."
+    if anomalous_cells:
+        return VOID, ("boundary anomaly (p*=0 with non-monotone stable-below-"
+                      f"collapse) in cells {anomalous_cells} — instrument "
+                      "failure until proven otherwise.")
+    return None, ""
 
 
 # ----------------------------------------------------------------------------

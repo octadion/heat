@@ -93,6 +93,19 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--analyze-only", action="store_true")
+    # Permanent methodological-integrity rules (see stage1b_common):
+    p.add_argument("--fresh-reference", action="store_true",
+                   help="RULE 2 override: proceed even though expected E1 "
+                        "reference files are absent from --results-dir "
+                        "(recorded; the verdict will be VOID without them).")
+    p.add_argument("--trust-existing-predictions", action="store_true",
+                   help="RULE 3: reuse an existing e6_predictions.json — ONLY "
+                        "after the audit confirmed its reference runs were "
+                        "genuine.")
+    p.add_argument("--requarantine-predictions", action="store_true",
+                   help="RULE 3: quarantine the existing e6_predictions.json "
+                        "to analysis/quarantine/ and re-freeze new "
+                        "predictions before any new grid run.")
     return p.parse_args()
 
 
@@ -183,13 +196,12 @@ def select_ref_lambda(args, manifest, corruption, eta, source_acc,
     return last
 
 
-def build_predictions(args, manifest):
+def build_predictions(args, manifest, policy: str):
     pred_path = Path(args.results_dir) / "analysis" / "e6_predictions.json"
-    if pred_path.exists():
+    if policy == "use":
         preds = json.loads(pred_path.read_text(encoding="utf-8"))
-        print(f"[preregistration] {pred_path} exists "
-              f"({preds.get('written_at_utc')}); never overwritten — resuming.",
-              flush=True)
+        print(f"[preregistration] reusing {pred_path.name} "
+              f"({preds.get('written_at_utc')}) — audit-confirmed.", flush=True)
         return preds, pred_path
 
     cells, violations = {}, {}
@@ -234,6 +246,8 @@ def build_predictions(args, manifest):
                               "of p; ||g_bar|| from the stable reference "
                               "lambda, E1 reference policy)",
         "preexisting_grid_violations": violations,
+        "fresh_reference": bool(getattr(args, "fresh_reference", False)),
+        "missing_e1_reference_cells": getattr(args, "_missing_e1", []),
         "cells": cells, "env": manifest.env,
     }
     pred_path.parent.mkdir(parents=True, exist_ok=True)
@@ -356,6 +370,12 @@ def analyze_e6(args, preds):
         in_bracket = (el_hat is not None and blo is not None and bhi is not None
                       and blo * eta <= el_hat <= bhi * eta)
         lam_star_soft = row["soft"]["p_star"]
+        # F1 fix: carry the boundary-resolution disambiguators. A p*=0 with a
+        # non-monotone note is a PATHOLOGICAL zero (stable-below-collapse),
+        # not a real boundary — it voids the verdict (RULE 1).
+        monotone = row["hard"]["monotone"]
+        note = row["hard"]["note"]
+        anomalous = (lam_star == 0.0 and monotone is False)
         rows.append({
             "cell": key, "corruption": corruption, "eta": eta,
             "gbar_frozen": pred.get("grad_norm_gbar"),
@@ -363,6 +383,8 @@ def analyze_e6(args, preds):
             "eta_lambda_hat": el_hat,
             "lambda_star_hard": lam_star, "eta_lambda_star_hard": el_star,
             "bracket_lambda": [blo, bhi],
+            "monotone_hard": monotone, "note_hard": note,
+            "anomalous_zero": anomalous,
             "within_25pct": within, "pred_in_bracket": in_bracket,
             "cell_hit": bool(within or in_bracket),
             "lambda_star_soft": lam_star_soft,
@@ -392,11 +414,22 @@ def e6_verdict(args, rows, bern_rows_hard):
     pooled_ok = (pooled_fit is not None and pooled_fit["r2"] is not None
                  and pooled_fit["r2"] >= 0.95)
     hits_ok = hits >= 3
-    verdict = "SAME-CURVE" if (slope_ok and pooled_ok and hits_ok) \
-        else "DIFFERENT-CURVE"
+
+    # RULE 1 (permanent): no reference points / no own points / boundary
+    # anomaly => VOID, never a curve verdict.
+    anomalous = [r["cell"] for r in rows if r.get("anomalous_zero")]
+    void, void_reason = sb.void_if_no_reference(
+        len(bern_pts), len(anchor_pts), anomalous, "Bernoulli hard (E1)")
+    if void:
+        verdict = sb.VOID
+    else:
+        verdict = "SAME-CURVE" if (slope_ok and pooled_ok and hits_ok) \
+            else "DIFFERENT-CURVE"
     return {
-        "verdict": verdict, "anchor_fit": anchor_fit, "pooled_fit": pooled_fit,
+        "verdict": verdict, "void_reason": void_reason,
+        "anchor_fit": anchor_fit, "pooled_fit": pooled_fit,
         "n_anchor_points": len(anchor_pts), "n_bernoulli_points": len(bern_pts),
+        "anomalous_cells": anomalous,
         "S_frozen": args.s_frozen,
         "slope_within_25pct_of_S_frozen": slope_ok,
         "pooled_r2_ge_095": pooled_ok,
@@ -454,8 +487,11 @@ def e6_plot(rows, bern_rows_hard, verdict, s_frozen, out_png: Path):
 
 
 def e6_markdown(args, preds, rows, verdict, a2_slopes) -> str:
-    L = [f"# E6 cross-mechanism verdict: **{verdict['verdict']}**", "",
-         "Criterion: SAME-CURVE requires (i) anchor slope within +/-25% of the "
+    L = [f"# E6 cross-mechanism verdict: **{verdict['verdict']}**", ""]
+    if verdict["verdict"] == sb.VOID:
+        L += [f"**VOID — {verdict['void_reason']}** (permanent rule: no "
+              "reference points / boundary anomaly => no curve verdict.)", ""]
+    L += ["Criterion: SAME-CURVE requires (i) anchor slope within +/-25% of the "
          f"Bernoulli hard-only reference S_frozen={args.s_frozen} "
          "(bracket-weighted, A2), (ii) pooled R^2 >= 0.95 over Bernoulli hard "
          "points + anchor points, (iii) >= 3 of 4 cells within +/-25% of the "
@@ -469,13 +505,16 @@ def e6_markdown(args, preds, rows, verdict, a2_slopes) -> str:
         L += ["**PRE-REGISTRATION VIOLATIONS:**"]
         L += [f"- {k}: lambda={v}" for k, v in viol.items()]
         L += [""]
-    L += ["| cell | ||g_bar|| | (ηλ)_hat | ηλ*_hard | bracket(λ) | within 25% "
-          "| in bracket | hit |", "|" + "---|" * 8]
+    L += ["| cell | ||g_bar|| | (ηλ)_hat | ηλ*_hard | bracket(λ) | monotone | "
+          "note | within 25% | in bracket | hit |", "|" + "---|" * 10]
     for r in rows:
         L.append("| " + " | ".join([
             r["cell"], _f(r["gbar_frozen"], 4), _f(r["eta_lambda_hat"]),
             _f(r["eta_lambda_star_hard"]),
             f"[{_f(r['bracket_lambda'][0])},{_f(r['bracket_lambda'][1])}]",
+            ("ANOMALOUS-ZERO" if r.get("anomalous_zero")
+             else str(r.get("monotone_hard"))),
+            str(r.get("note_hard") or "-"),
             str(r["within_25pct"]), str(r["pred_in_bracket"]),
             "YES" if r["cell_hit"] else "no"]) + " |")
     af, pf = verdict["anchor_fit"], verdict["pooled_fit"]
@@ -520,11 +559,23 @@ def main():
         if not args.ckpt_wrn or not Path(args.ckpt_wrn).exists():
             raise SystemExit(f"[fatal] WRN checkpoint not found: "
                              f"{args.ckpt_wrn!r} (or pass --analyze-only)")
+        # RULE 2: abort loudly if the E1 reference is absent here.
+        args._missing_e1 = sb.require_e1_reference(
+            Path(args.results_dir), sb.E6_CELLS, args.severity, args.seed,
+            fresh_ok=args.fresh_reference)
+        # RULE 3: an existing pre-registration is INVALID by default.
+        policy = sb.resolve_predictions_policy(
+            pred_path, args.trust_existing_predictions,
+            args.requarantine_predictions)
         manifest = Manifest(Path(args.results_dir), args,
                             campaign="stage1b_e6",
                             filename="stage1b_e6_manifest.jsonl")
-        print(f"[e6] env={manifest.env}  S_frozen={args.s_frozen}", flush=True)
-        preds, pred_path = build_predictions(args, manifest)
+        manifest.log(event="rules", predictions_policy=policy,
+                     fresh_reference=args.fresh_reference,
+                     missing_e1_cells=len(args._missing_e1))
+        print(f"[e6] env={manifest.env}  S_frozen={args.s_frozen}  "
+              f"predictions_policy={policy}", flush=True)
+        preds, pred_path = build_predictions(args, manifest, policy)
         for corruption, eta in sb.E6_CELLS:
             sweep_cell(args, manifest, preds, corruption, eta)
 

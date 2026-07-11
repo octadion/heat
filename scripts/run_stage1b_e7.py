@@ -97,6 +97,19 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--analyze-only", action="store_true")
+    # Permanent methodological-integrity rules (see stage1b_common):
+    p.add_argument("--fresh-reference", action="store_true",
+                   help="RULE 2 override: proceed even though expected E1 "
+                        "reference files are absent from --results-dir "
+                        "(recorded; the verdict will be VOID without them).")
+    p.add_argument("--trust-existing-predictions", action="store_true",
+                   help="RULE 3: reuse an existing e7_predictions.json — ONLY "
+                        "after the audit confirmed its reference runs were "
+                        "genuine.")
+    p.add_argument("--requarantine-predictions", action="store_true",
+                   help="RULE 3: quarantine the existing e7_predictions.json "
+                        "to analysis/quarantine/ and re-freeze new "
+                        "predictions before any new grid run.")
     return p.parse_args()
 
 
@@ -183,13 +196,12 @@ def select_ref_p(args, manifest, corruption, eta, source_acc, log_prefix=""):
     return last
 
 
-def build_predictions(args, manifest):
+def build_predictions(args, manifest, policy: str):
     pred_path = Path(args.results_dir) / "analysis" / "e7_predictions.json"
-    if pred_path.exists():
+    if policy == "use":
         preds = json.loads(pred_path.read_text(encoding="utf-8"))
-        print(f"[preregistration] {pred_path} exists "
-              f"({preds.get('written_at_utc')}); never overwritten — resuming.",
-              flush=True)
+        print(f"[preregistration] reusing {pred_path.name} "
+              f"({preds.get('written_at_utc')}) — audit-confirmed.", flush=True)
         return preds, pred_path
 
     cells, violations = {}, {}
@@ -233,6 +245,8 @@ def build_predictions(args, manifest):
                               "||g_bar||_entropy from the stable entropy "
                               "reference run, E1 reference policy)",
         "preexisting_grid_violations": violations,
+        "fresh_reference": bool(getattr(args, "fresh_reference", False)),
+        "missing_e1_reference_cells": getattr(args, "_missing_e1", []),
         "cells": cells, "env": manifest.env,
     }
     pred_path.parent.mkdir(parents=True, exist_ok=True)
@@ -348,12 +362,18 @@ def analyze_e7(args, preds):
                   and abs(p_star - p_hat) / p_hat <= PRED_TOL)
         in_bracket = (p_hat is not None and blo is not None and bhi is not None
                       and blo <= p_hat <= bhi)
+        # F1 fix: carry the boundary-resolution disambiguators (RULE 1).
+        monotone = row["hard"]["monotone"]
+        note = row["hard"]["note"]
+        anomalous = (p_star == 0.0 and monotone is False)
         rows.append({
             "cell": key, "corruption": corruption, "eta": eta,
             "gbar_entropy_frozen": pred.get("grad_norm_gbar_entropy"),
             "x_eta_gbar_entropy": pred.get("eta_times_gbar_entropy"),
             "p_hat_strong": p_hat, "p_star_hard": p_star,
             "bracket": [blo, bhi],
+            "monotone_hard": monotone, "note_hard": note,
+            "anomalous_zero": anomalous,
             "within_25pct": within, "pred_in_bracket": in_bracket,
             "cell_hit": bool(within or in_bracket),
             "p_star_soft": row["soft"]["p_star"],
@@ -403,7 +423,7 @@ def matched_calmness(args, corruption, eta=1e-3):
             "entropy": sb.calmness_metrics(entropy[p])}
 
 
-def e7_verdict(rows):
+def e7_verdict(rows, n_energy_reference_points):
     pts = [(r["x_eta_gbar_entropy"], r["p_star_hard"]) for r in rows
            if r["x_eta_gbar_entropy"] is not None
            and r["p_star_hard"] is not None]
@@ -417,7 +437,16 @@ def e7_verdict(rows):
     unresolved = sum(1 for r in rows if r["p_star_hard"] is None)
     linear = fit is not None and fit["r2"] is not None and fit["r2"] >= WEAK_R2
     strong = (n_ev > 0 and hits >= strong_need and linear)
-    if strong:
+
+    # RULE 1 (permanent): the drive-swap comparison is against the E1 energy
+    # reference; zero reference points, zero entropy points, or a boundary
+    # anomaly => VOID, never a curve verdict.
+    anomalous = [r["cell"] for r in rows if r.get("anomalous_zero")]
+    void, void_reason = sb.void_if_no_reference(
+        n_energy_reference_points, len(pts), anomalous, "E1 energy hard")
+    if void:
+        label = sb.VOID
+    elif strong:
         label = "DRIVE-AGNOSTIC-STRONG"
     elif linear and monotone:
         label = "DRIVE-AGNOSTIC-WEAK"
@@ -425,7 +454,10 @@ def e7_verdict(rows):
         label = "DRIVE-SENSITIVE"
     else:
         label = "UNCLASSIFIABLE"
-    return {"verdict": label, "entropy_fit": fit, "n_points": len(pts),
+    return {"verdict": label, "void_reason": void_reason,
+            "n_energy_reference_points": n_energy_reference_points,
+            "anomalous_cells": anomalous,
+            "entropy_fit": fit, "n_points": len(pts),
             "monotone_in_x": monotone, "strong_hits": hits,
             "n_evaluable": n_ev, "strong_hits_needed": strong_need,
             "weak_form_linear_r2_ge_09": linear,
@@ -480,8 +512,11 @@ def e7_plot(args, rows, verdict, energy_rows_hard, out_png: Path):
 
 
 def e7_markdown(args, preds, rows, verdict, calm) -> str:
-    L = [f"# E7 drive-swap verdict: **{verdict['verdict']}**", "",
-         "Two-tier hypothesis (pre-registered). Strong form: p_hat = S_frozen "
+    L = [f"# E7 drive-swap verdict: **{verdict['verdict']}**", ""]
+    if verdict["verdict"] == sb.VOID:
+        L += [f"**VOID — {verdict['void_reason']}** (permanent rule: no "
+              "reference points / boundary anomaly => no curve verdict.)", ""]
+    L += ["Two-tier hypothesis (pre-registered). Strong form: p_hat = S_frozen "
          "* eta * ||g_bar||_entropy (same R — drive-independent); hit = "
          "measured p*_hard within +/-25% (or within the bisection bracket). "
          f"Strong label needs hits >= ceil(0.75*n_evaluable) = "
@@ -495,13 +530,17 @@ def e7_markdown(args, preds, rows, verdict, calm) -> str:
         L += ["**PRE-REGISTRATION VIOLATIONS:**"]
         L += [f"- {k}: p={v}" for k, v in viol.items()]
         L += [""]
-    L += ["| cell | ||g_bar||_entropy | p_hat | p*_hard | bracket | within 25% "
-          "| in bracket | hit | p*_soft |", "|" + "---|" * 9]
+    L += ["| cell | ||g_bar||_entropy | p_hat | p*_hard | bracket | monotone | "
+          "note | within 25% | in bracket | hit | p*_soft |",
+          "|" + "---|" * 11]
     for r in rows:
         L.append("| " + " | ".join([
             r["cell"], _f(r["gbar_entropy_frozen"], 4), _f(r["p_hat_strong"]),
             _f(r["p_star_hard"]),
             f"[{_f(r['bracket'][0])},{_f(r['bracket'][1])}]",
+            ("ANOMALOUS-ZERO" if r.get("anomalous_zero")
+             else str(r.get("monotone_hard"))),
+            str(r.get("note_hard") or "-"),
             str(r["within_25pct"]), str(r["pred_in_bracket"]),
             "YES" if r["cell_hit"] else "no", _f(r["p_star_soft"])]) + " |")
     f = verdict["entropy_fit"]
@@ -552,11 +591,23 @@ def main():
         if not args.ckpt_wrn or not Path(args.ckpt_wrn).exists():
             raise SystemExit(f"[fatal] WRN checkpoint not found: "
                              f"{args.ckpt_wrn!r} (or pass --analyze-only)")
+        # RULE 2: abort loudly if the E1 reference is absent here.
+        args._missing_e1 = sb.require_e1_reference(
+            Path(args.results_dir), e7_cells(), args.severity, args.seed,
+            fresh_ok=args.fresh_reference)
+        # RULE 3: an existing pre-registration is INVALID by default.
+        policy = sb.resolve_predictions_policy(
+            pred_path, args.trust_existing_predictions,
+            args.requarantine_predictions)
         manifest = Manifest(Path(args.results_dir), args,
                             campaign="stage1b_e7",
                             filename="stage1b_e7_manifest.jsonl")
-        print(f"[e7] env={manifest.env}  S_frozen={args.s_frozen}", flush=True)
-        preds, pred_path = build_predictions(args, manifest)
+        manifest.log(event="rules", predictions_policy=policy,
+                     fresh_reference=args.fresh_reference,
+                     missing_e1_cells=len(args._missing_e1))
+        print(f"[e7] env={manifest.env}  S_frozen={args.s_frozen}  "
+              f"predictions_policy={policy}", flush=True)
+        preds, pred_path = build_predictions(args, manifest, policy)
         for corruption, eta in e7_cells():
             sweep_cell(args, manifest, preds, corruption, eta)
 
@@ -565,9 +616,13 @@ def main():
     preds = json.loads(pred_path.read_text(encoding="utf-8"))
 
     rows = analyze_e7(args, preds)
-    verdict = e7_verdict(rows)
     energy_rows_hard = e1_all_rows(Path(args.results_dir), args.severity,
                                    args.seed, hard_only=True)
+    n_energy_ref = sum(1 for r in energy_rows_hard
+                       if r["corruption"] in sb.E7_CORRUPTIONS
+                       and r.get("eta_times_gbar") is not None
+                       and r.get("p_star") is not None)
+    verdict = e7_verdict(rows, n_energy_ref)
     calm = [matched_calmness(args, c) for c in sb.E7_CORRUPTIONS]
 
     analysis_dir = Path(args.results_dir) / "analysis"

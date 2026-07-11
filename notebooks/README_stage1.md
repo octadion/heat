@@ -173,6 +173,28 @@ python scripts/run_stage1b_e7.py --results-dir /content/drive/MyDrive/pstar_resu
     --ckpt-wrn experiments/checkpoints/wrn28_10_final.pt --c10c-root data/cifar10c
 ```
 
+**PERMANENT METHODOLOGICAL-INTEGRITY RULES** (post-audit; encoded in
+`stage1b_common.py`, apply to E6/E7 and every Stage-2+ analyzer/orchestrator):
+
+- **RULE 1 (VOID guard):** if no reference points are discoverable (e.g. zero
+  E1 Bernoulli hard points), or any fitted cell shows the pathological
+  `p*=0` non-monotone (stable-below-collapse) boundary, the verdict is
+  **VOID** — never a curve verdict.
+- **RULE 2 (loud abort):** E6/E7 refuse to start when the expected E1
+  reference files are absent from `--results-dir` (silent re-running of
+  references is forbidden) unless `--fresh-reference` is explicitly passed
+  (recorded in the manifest + predictions file).
+- **RULE 3 (predictions validity):** an existing `e6/e7_predictions.json` is
+  INVALID by default. Pass `--trust-existing-predictions` only if the audit
+  confirmed its reference ‖ḡ‖ runs were genuine (correct checkpoint +
+  correct dispatch), or `--requarantine-predictions` to move it to
+  `analysis/quarantine/` (with a note, never overwritten) and re-freeze new
+  predictions BEFORE any new grid run.
+
+Forensic audit (Part A, zero GPU, read-only — run where the campaign files
+live): `python scripts/audit_stage1b.py --results-dir <campaign dir>
+[--e1-results-dir <E1 dir>]` → one-line root causes + `analysis/stage1b_audit.md`.
+
 Verdicts (mechanical): E6 **SAME-CURVE** = anchor slope within ±25% of
 S_frozen AND pooled (anchor + Bernoulli hard points) R² ≥ 0.95 AND ≥3/4 cells
 within ±25% of the frozen prediction (or in-bracket); else **DIFFERENT-CURVE**.

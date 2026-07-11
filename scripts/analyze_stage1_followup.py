@@ -336,8 +336,18 @@ def freeze_hard_slope(a2, out_path: Path):
     """Freeze S_frozen for Part B. S_frozen = the pooled bracket-weighted
     HARD-ONLY WLS slope (with-intercept model; the intercept is dropped when
     the prediction p_hat = S*eta*||g_bar|| is formed, per the follow-up spec).
-    The through-origin and calibration-only variants are recorded alongside."""
+    The through-origin and calibration-only variants are recorded alongside.
+
+    PERMANENT RULE (Stage-1b audit, F2): if the pooled refit is not
+    computable (no usable E1 hard points in the dir), REFUSE to write a null
+    frozen artifact — downstream campaigns gate on this file."""
     pooled = a2["pooled"]["wls"]
+    if pooled is None or pooled.get("slope") is None:
+        raise SystemExit(
+            "[ABORT — VOID] the bracket-weighted pooled hard-only refit is "
+            "not computable (no usable E1 hard points found in this results "
+            "dir). Refusing to write a null stage1_hardslope_frozen.json. "
+            "Point --results-dir at the dir holding the E1 JSONs.")
     payload = {
         "S_frozen": pooled["slope"] if pooled else None,
         "S_frozen_definition": "pooled bracket-weighted hard-only WLS slope "
