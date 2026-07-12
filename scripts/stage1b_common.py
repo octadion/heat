@@ -60,19 +60,29 @@ E7_ETAS = [5e-4, 1e-3, 2e-3]
 # Tags / paths / discovery — E6 anchor.
 # ----------------------------------------------------------------------------
 
-def variant_tag_anchor(corruption: str, lam: float, eta: float) -> str:
-    return f"pstar_{corruption}_lr{pc.format_p(eta)}_anchor_lam{pc.format_p(lam)}"
+def _cyc_prefix(cycles) -> str:
+    """Cycled-protocol tag infix. cycles=None keeps the legacy (single-pass)
+    tag — those runs are VOID for law measurement but their files/discovery
+    remain readable for audits."""
+    return f"cyc{cycles}_" if cycles else ""
+
+
+def variant_tag_anchor(corruption: str, lam: float, eta: float,
+                       cycles: Optional[int] = None) -> str:
+    return (f"pstar_{_cyc_prefix(cycles)}{corruption}_lr{pc.format_p(eta)}"
+            f"_anchor_lam{pc.format_p(lam)}")
 
 
 def run_output_path_anchor(results_dir, arch, corruption, severity, seed,
-                           lam, eta) -> Path:
-    tag = variant_tag_anchor(corruption, lam, eta)
+                           lam, eta, cycles: Optional[int] = None) -> Path:
+    tag = variant_tag_anchor(corruption, lam, eta, cycles=cycles)
     return Path(results_dir) / f"p9_{arch}_{tag}_seed{seed}_sev{severity}.json"
 
 
 def discover_lambdas(results_dir, arch, corruption, severity, seed,
-                     eta) -> list[float]:
-    prefix = f"p9_{arch}_pstar_{corruption}_lr{pc.format_p(eta)}_anchor_lam"
+                     eta, cycles: Optional[int] = None) -> list[float]:
+    prefix = (f"p9_{arch}_pstar_{_cyc_prefix(cycles)}{corruption}"
+              f"_lr{pc.format_p(eta)}_anchor_lam")
     suffix = f"_seed{seed}_sev{severity}.json"
     pat = re.compile(re.escape(prefix) + r"(.+?)" + re.escape(suffix) + r"$")
     out = []
@@ -90,21 +100,23 @@ def discover_lambdas(results_dir, arch, corruption, severity, seed,
 # Tags / paths / discovery — E7 drive.
 # ----------------------------------------------------------------------------
 
-def variant_tag_drive(corruption: str, drive: str, p: float, eta: float) -> str:
-    return (f"pstar_{corruption}_lr{pc.format_p(eta)}_drive_{drive}"
-            f"_p{pc.format_p(p)}")
+def variant_tag_drive(corruption: str, drive: str, p: float, eta: float,
+                      cycles: Optional[int] = None) -> str:
+    return (f"pstar_{_cyc_prefix(cycles)}{corruption}_lr{pc.format_p(eta)}"
+            f"_drive_{drive}_p{pc.format_p(p)}")
 
 
 def run_output_path_drive(results_dir, arch, corruption, severity, seed,
-                          drive, p, eta) -> Path:
-    tag = variant_tag_drive(corruption, drive, p, eta)
+                          drive, p, eta, cycles: Optional[int] = None) -> Path:
+    tag = variant_tag_drive(corruption, drive, p, eta, cycles=cycles)
     return Path(results_dir) / f"p9_{arch}_{tag}_seed{seed}_sev{severity}.json"
 
 
 def discover_drive_p_values(results_dir, arch, corruption, severity, seed,
-                            drive, eta) -> list[float]:
-    prefix = (f"p9_{arch}_pstar_{corruption}_lr{pc.format_p(eta)}"
-              f"_drive_{drive}_p")
+                            drive, eta,
+                            cycles: Optional[int] = None) -> list[float]:
+    prefix = (f"p9_{arch}_pstar_{_cyc_prefix(cycles)}{corruption}"
+              f"_lr{pc.format_p(eta)}_drive_{drive}_p")
     suffix = f"_seed{seed}_sev{severity}.json"
     pat = re.compile(re.escape(prefix) + r"(.+?)" + re.escape(suffix) + r"$")
     out = []
@@ -123,46 +135,53 @@ def discover_drive_p_values(results_dir, arch, corruption, severity, seed,
 # ----------------------------------------------------------------------------
 
 def _base_cmd(run_tier2, arch, checkpoint, corruption, severity, seed,
-              results_dir, c10c_root, batch_size, num_workers, python=None):
+              results_dir, c10c_root, batch_size, num_workers, python=None,
+              cycles: Optional[int] = None):
     python = python or sys.executable
+    n = cycles or 1
     return [
         python, str(run_tier2), "--protocol", "p9", "--arch", arch,
         "--dataset", "cifar10", "--checkpoint", str(checkpoint),
         "--c10c-root", str(c10c_root), "--severity", str(severity),
         "--seed", str(seed), "--batch-size", str(batch_size),
         "--num-workers", str(num_workers), "--out-dir", str(results_dir),
-        "--corruptions", str(corruption),
+        "--corruptions", *([str(corruption)] * n),
     ]
 
 
 def build_run_command_anchor(*, run_tier2, arch, checkpoint, corruption,
                              severity, seed, results_dir, c10c_root, heat_lr,
                              anchor_lambda, batch_size=64, num_workers=2,
-                             python=None) -> list[str]:
+                             python=None,
+                             cycles: Optional[int] = None) -> list[str]:
     cmd = _base_cmd(run_tier2, arch, checkpoint, corruption, severity, seed,
-                    results_dir, c10c_root, batch_size, num_workers, python)
+                    results_dir, c10c_root, batch_size, num_workers, python,
+                    cycles=cycles)
     cmd += ["--methods", "heat",
             "--heat-lr", repr(float(heat_lr)),
             "--heat-restore-prob", "0",
             "--heat-anchor-lambda", repr(float(anchor_lambda)),
             "--heat-diagnostic-snapshot",
             "--variant-tag", variant_tag_anchor(corruption, anchor_lambda,
-                                                heat_lr)]
+                                                heat_lr, cycles=cycles)]
     return cmd
 
 
 def build_run_command_drive(*, run_tier2, arch, checkpoint, corruption,
                             severity, seed, results_dir, c10c_root, heat_lr,
                             drive, p, batch_size=64, num_workers=2,
-                            python=None) -> list[str]:
+                            python=None,
+                            cycles: Optional[int] = None) -> list[str]:
     cmd = _base_cmd(run_tier2, arch, checkpoint, corruption, severity, seed,
-                    results_dir, c10c_root, batch_size, num_workers, python)
+                    results_dir, c10c_root, batch_size, num_workers, python,
+                    cycles=cycles)
     cmd += ["--methods", "heat",
             "--heat-lr", repr(float(heat_lr)),
             "--heat-restore-prob", pc.format_p(p),
             "--drive", str(drive),
             "--heat-diagnostic-snapshot",
-            "--variant-tag", variant_tag_drive(corruption, drive, p, heat_lr)]
+            "--variant-tag", variant_tag_drive(corruption, drive, p, heat_lr,
+                                               cycles=cycles)]
     return cmd
 
 
@@ -261,17 +280,31 @@ VOID = "VOID"
 
 
 def require_e1_reference(results_dir, cells, severity, seed,
-                         fresh_ok: bool) -> list[dict]:
+                         fresh_ok: bool,
+                         cycles: Optional[int] = None) -> list[dict]:
     """RULE 2. `cells` = [(corruption, eta), ...] the campaign will use.
-    Returns the missing-reference report (empty if all present). Aborts loudly
-    when anything is missing and fresh_ok is False."""
+    With `cycles` set, the reference is the CYCLED (v2) E1 campaign; else the
+    legacy single-pass files. Returns the missing-reference report (empty if
+    all present). Aborts loudly when anything is missing and fresh_ok is
+    False."""
     missing = []
+    if cycles:
+        from scripts import stage1v2_common as v2
     for corruption, eta in cells:
-        src_ok = sc.run_output_path_sc(results_dir, sc.E1_ARCH, corruption,
-                                       severity, seed, source=True,
-                                       eta=eta).exists()
-        n_pts = len(sc.discover_p_values_sc(results_dir, sc.E1_ARCH,
-                                            corruption, severity, seed, eta))
+        if cycles:
+            src_ok = v2.run_output_path_v2(results_dir, sc.E1_ARCH, corruption,
+                                           severity, seed, source=True,
+                                           eta=eta, cycles=cycles).exists()
+            n_pts = len(v2.discover_p_values_v2(results_dir, sc.E1_ARCH,
+                                                corruption, severity, seed,
+                                                eta, cycles=cycles))
+        else:
+            src_ok = sc.run_output_path_sc(results_dir, sc.E1_ARCH, corruption,
+                                           severity, seed, source=True,
+                                           eta=eta).exists()
+            n_pts = len(sc.discover_p_values_sc(results_dir, sc.E1_ARCH,
+                                                corruption, severity, seed,
+                                                eta))
         if not src_ok or n_pts == 0:
             missing.append({"corruption": corruption, "eta": eta,
                             "source_present": src_ok,
@@ -357,11 +390,19 @@ def void_if_no_reference(n_reference_points: int, n_own_points: int,
 # per block (single block for single-corruption streams).
 # ----------------------------------------------------------------------------
 
-def calmness_metrics(data) -> Optional[dict[str, float]]:
+def calmness_metrics(data, cycles: Optional[int] = None) -> Optional[dict[str, float]]:
+    """Stationary drift variance + step-to-step grad_l2 variance. With
+    `cycles` set, blocks are CYCLE-blocks (local_step resets), since all
+    cycles share the corruption name and the stock grouping would merge them."""
     rows = pc.stream_rows(data)
     if not rows or pc.first_nonfinite_step(rows) is not None:
         return None
-    groups = group_rows_by_block(rows)
+    if cycles:
+        from scripts import stage1v2_common as v2
+        groups = {f"cyc{i}": cyc
+                  for i, cyc in enumerate(v2.group_rows_by_cycle(rows))}
+    else:
+        groups = group_rows_by_block(rows)
     drifts, gdiffs = [], []
     for _name, brows in groups.items():
         ordered = sorted(brows, key=lambda r: (r.get("local_step") or 0))

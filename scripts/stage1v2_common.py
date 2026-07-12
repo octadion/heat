@@ -178,9 +178,11 @@ def file_sha256(path, chars: int = 16) -> str:
 
 
 def inject_fingerprint(json_path: Path, *, corruption, cycle_count, eta, p,
-                       checkpoint_hash, seed, batch_size) -> dict:
+                       checkpoint_hash, seed, batch_size,
+                       extra: Optional[dict] = None) -> dict:
     """Embed the protocol fingerprint into a run JSON (atomic rewrite).
-    Idempotent: an existing fingerprint is kept verbatim."""
+    Idempotent: an existing fingerprint is kept verbatim. `extra` carries
+    variant fields (e.g. anchor_lambda, drive)."""
     data = pc.load_json(json_path)
     if "protocol_fingerprint" in data:
         return data["protocol_fingerprint"]
@@ -194,6 +196,7 @@ def inject_fingerprint(json_path: Path, *, corruption, cycle_count, eta, p,
         "seed": seed,
         "batch_size": batch_size,
         "protocol": f"single-corruption severity-5 split cycled x{cycle_count}",
+        **(extra or {}),
     }
     data["protocol_fingerprint"] = fp
     tmp = json_path.with_suffix(".tmp")
